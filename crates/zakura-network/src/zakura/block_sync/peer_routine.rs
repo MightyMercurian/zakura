@@ -4378,7 +4378,7 @@ mod tests {
         routine.allow_no_progress_park = false;
         assert!(matches!(
             routine.no_progress_stall(Instant::now(), "stalled"),
-            Err(SinkReject::Local(_))
+            Err(crate::zakura::SinkReject::Local(_))
         ));
     }
 }
