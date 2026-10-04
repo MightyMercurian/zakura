@@ -22,9 +22,8 @@ impl BlockRangeSource for StateBlockRangeSource {
         let mut state = self.state.clone();
         Box::pin(async move {
             let mut started = false;
-            let result = tokio::time::timeout(
-                super::ZAKURA_BLOCK_SYNC_DRIVER_TIMEOUT,
-                state.read_owned_block_range(
+            let result = state
+                .read_owned_block_range(
                     request.start_height,
                     request.count,
                     request.max_body_bytes,
@@ -35,9 +34,8 @@ impl BlockRangeSource for StateBlockRangeSource {
                         }
                         !started || lease.is_cancelled()
                     },
-                ),
-            )
-            .await??;
+                )
+                .await?;
             let (blocks, lease) = result.into_parts();
             Ok(BlockRangeReadResult {
                 blocks: blocks
