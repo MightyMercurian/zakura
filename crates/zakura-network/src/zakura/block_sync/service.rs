@@ -133,6 +133,18 @@ impl BlockSyncPeerSession {
         }
     }
 
+    pub(super) fn received_status(&self) -> Option<BlockSyncStatus> {
+        self.status_sender
+            .as_ref()
+            .and_then(|state| state.received())
+    }
+
+    pub(super) fn record_received_status(&self, status: BlockSyncStatus) {
+        if let Some(state) = &self.status_sender {
+            state.record_received(status);
+        }
+    }
+
     pub(super) fn status_next_due(&self) -> Option<Instant> {
         self.status_sender
             .as_ref()
@@ -1130,10 +1142,17 @@ mod regulated_frame_tests {
                 .clone()
         };
         let first = attach(1);
+        let received = BlockSyncStatus {
+            servable_high: block::Height(20),
+            ..Default::default()
+        };
+        first.record_received(received);
         let replacement = attach(1);
+        assert_eq!(replacement.received(), Some(received));
         assert!(Arc::ptr_eq(&first, &replacement));
         let new_connection = attach(2);
         assert!(!Arc::ptr_eq(&first, &new_connection));
+        assert_eq!(new_connection.received(), None);
         service.remove_peer(&peer, 1);
         assert!(!service
             .inner

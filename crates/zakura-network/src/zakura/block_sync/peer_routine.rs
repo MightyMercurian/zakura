@@ -441,6 +441,11 @@ impl PeerRoutine {
     /// pipe tears the whole connection down.
     pub(super) async fn run(mut self) -> Result<(), SinkReject> {
         let mut guard = block_sync_guard();
+        // A stream replacement keeps the same connection advertisement. Waiting
+        // for a fresh one would stall requests until the next cadence interval.
+        if let Some(status) = self.session.received_status() {
+            self.handle_status(status);
+        }
         let result = self.run_inner(&mut guard).await;
         // A transport failure can cancel the session before its queued responses
         // reach us. Validate them under the existing decode-capacity bound before
@@ -749,6 +754,7 @@ impl PeerRoutine {
                 });
             return;
         }
+        self.session.record_received_status(status);
         let now = Instant::now();
         let range_changed =
             status.servable_high != self.servable_high || status.servable_low != self.servable_low;

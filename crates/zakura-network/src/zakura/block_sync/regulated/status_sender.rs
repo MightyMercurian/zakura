@@ -1,4 +1,4 @@
-//! One coalescing Status sender for the lifetime of a connection.
+//! Status cadence and the latest received advertisement live with the connection.
 
 use super::wire::Message;
 use crate::zakura::{
@@ -12,21 +12,35 @@ use std::{
 };
 
 #[derive(Debug)]
-pub(crate) struct StatusSender(Mutex<CadenceSender<Message>>);
+pub(crate) struct StatusSender {
+    sender: Mutex<CadenceSender<Message>>,
+    received: Mutex<Option<BlockSyncStatus>>,
+}
 
 impl Default for StatusSender {
     fn default() -> Self {
-        Self(Mutex::new(CadenceSender::new()))
+        Self {
+            sender: Mutex::new(CadenceSender::new()),
+            received: Mutex::new(None),
+        }
     }
 }
 
 impl StatusSender {
+    pub(crate) fn record_received(&self, status: BlockSyncStatus) {
+        *self.received.lock().unwrap_or_else(PoisonError::into_inner) = Some(status);
+    }
+
+    pub(crate) fn received(&self) -> Option<BlockSyncStatus> {
+        *self.received.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
     pub(crate) fn try_send(
         &self,
         status: BlockSyncStatus,
         send: &FramedSend,
     ) -> Result<(), OrderedSendError> {
-        let mut sender = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut sender = self.sender.lock().unwrap_or_else(PoisonError::into_inner);
         sender
             .update(Message::Status(status))
             .map_err(|error| OrderedSendError::Encode(error.into()))?;
@@ -39,7 +53,7 @@ impl StatusSender {
     }
 
     pub(crate) fn next_due(&self) -> Option<Instant> {
-        self.0
+        self.sender
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .next_due()
