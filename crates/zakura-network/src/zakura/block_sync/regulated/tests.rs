@@ -617,6 +617,10 @@ async fn queued_getblocks_commitments_have_a_measured_memory_ceiling() {
 #[tokio::test]
 #[ignore = "manual load measurement: retains tens of GB at the current defaults"]
 async fn maximum_admitted_getblocks_sessions_have_a_measured_memory_ceiling() {
+    // Broad CI includes ignored tests. This measurement needs a dedicated large host.
+    if std::env::var_os("ZAKURA_LARGE_LOAD_TEST").is_none() {
+        return;
+    }
     let peers = super::super::ZakuraBlockSyncConfig::default().peer_limits;
     measure_waiting_getblocks_sessions(peers.max_inbound_peers + peers.max_outbound_peers);
 }

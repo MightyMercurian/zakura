@@ -106,3 +106,31 @@ or small fixtures.
 Run focused regressions on pull requests and broader generated/load cases on a schedule.
 Do not claim exhaustive coverage. A future explorer must state model bounds, production
 correspondence, and completion status.
+
+## Activation measurements
+
+On October 4, 2026, the debug build on an ARM64 Mac retained about 44.1 MB for
+64,000 waiting GetBlocks commitments in one session after response channels became lazy.
+The maximum-session probe retained 22,567,691,400 allocator-requested bytes for 512 sessions
+with 64,000 commitments each. Admission took 314.8 seconds. Both probes hold requests before
+workers start. They include request bookkeeping, not storage results, QUIC buffers, or process RSS.
+The per-request regression ceiling is 1,024 retained bytes, not a memory target.
+
+The full probe is ignored and additionally requires `ZAKURA_LARGE_LOAD_TEST=1`, because CI also
+runs ignored tests and this probe needs tens of GB. Run the
+`maximum_admitted_getblocks_sessions_have_a_measured_memory_ceiling` test with that variable,
+the `zakura-testkit` feature, and `--ignored --nocapture` on a dedicated large host.
+
+These measurements do not validate the 32,000 advertised default. Capacity tuning still needs
+useful-serving and unavailable-range throughput and storage-cost measurements against the
+10 Gbps at 500 ms design target. The existing 32 MiB QUIC send window is a separate throughput
+ceiling. Do not shrink request counts using the maximum response size alone when requests may
+return one small block.
+
+The stream-6 conformance adapter exercises the production layout over QUIC, including simultaneous
+serving and exhausted credit. It uses the shared serving harness, so the production GetBlocks
+peer-routine QUIC test remains a separate check. Existing synthetic tests without a range source
+still exercise the old serving path and do not establish regulated-path coverage.
+
+Activation also remains gated on mixed-version retry behavior and the version-2 hash-mismatch
+policy. Neither policy is changed by the decoder or shared serving prerequisites.
