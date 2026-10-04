@@ -18,6 +18,8 @@ use crate::zakura::{
     Frame, ZakuraPeerId,
 };
 
+mod load;
+
 #[derive(Debug)]
 struct Store {
     blocks: Vec<(block::Height, Arc<block::Block>)>,
@@ -639,8 +641,12 @@ async fn maximum_admitted_getblocks_sessions_have_a_measured_memory_ceiling() {
 
 #[allow(clippy::print_stderr)] // Manual load runs report measured bytes and admission time.
 fn measure_waiting_getblocks_sessions(peers: usize) {
-    let config = super::super::ZakuraBlockSyncConfig::default();
-    let serving = super::session::Serving::new(store(&[], false), &config);
+    measure_waiting_getblocks_capacity(peers, &super::super::ZakuraBlockSyncConfig::default());
+}
+
+#[allow(clippy::print_stderr)]
+fn measure_waiting_getblocks_capacity(peers: usize, config: &super::super::ZakuraBlockSyncConfig) {
+    let serving = super::session::Serving::new(store(&[], false), config);
     let cancel = CancellationToken::new();
     let count = config.advertised_max_inflight_requests() * 2;
     let started = std::time::Instant::now();

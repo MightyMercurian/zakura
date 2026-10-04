@@ -122,11 +122,33 @@ runs ignored tests and this probe needs tens of GB. Run the
 `maximum_admitted_getblocks_sessions_have_a_measured_memory_ceiling` test with that variable,
 the `zakura-testkit` feature, and `--ignored --nocapture` on a dedicated large host.
 
-These measurements do not validate the 32,000 advertised default. Capacity tuning still needs
-useful-serving and unavailable-range throughput and storage-cost measurements against the
-10 Gbps at 500 ms design target. The existing 32 MiB QUIC send window is a separate throughput
-ceiling. Do not shrink request counts using the maximum response size alone when requests may
-return one small block.
+The smaller candidate probe measured waiting commitments at twice each advertised limit:
+
+| Advertised requests per peer | Waiting commitments | Retained bookkeeping bytes |
+| --- | --- | --- |
+| 32 | 64 | 50,684 |
+| 128 | 256 | 182,940 |
+| 512 | 1,024 | 712,188 |
+| 32,000 | 64,000 | 44,077,788 |
+
+Run `serving_capacity_candidates` with `ZAKURA_CAPACITY_PROBE=1`, the `zakura-testkit` feature,
+and ignored tests enabled to reproduce the table and the fixture throughput probe. On the same
+host and debug build, the candidates completed 24,411–42,942 unavailable responses per second,
+29,979–37,132 single-small-block responses per second, and 434–437 configured 128-block responses
+per second. The latter workload explicitly raises the default one-block response limit. The
+probe checks the number of bodies served. It uses synthetic storage and an in-process queue,
+so these are CPU/queue observations without disk cost, QUIC backpressure, or an injected RTT.
+
+These measurements do not validate the 32,000 advertised default. A single small-block response
+in this fixture averages about 1,644 wire bytes. At that size, the design's twice-bandwidth-delay
+allowance at 10 Gbps and 500 ms needs about 760,341 commitments, exceeding the protocol's 32,768
+ceiling. The existing 32 MiB QUIC send window also limits transport to about 537 Mbps at that RTT,
+before overhead. A lower request count alone cannot establish the target.
+
+Keep activation in draft until representative production-storage and QUIC measurements justify
+the capacity default and reconcile the throughput target with response batching and the transport
+window. Do not silently change those policies or size request counts using the maximum response
+alone when the default serves one block.
 
 The stream-6 conformance adapter exercises the production layout over QUIC, including simultaneous
 serving and exhausted credit. It uses the shared serving harness, so the production GetBlocks
