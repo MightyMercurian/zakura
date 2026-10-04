@@ -429,12 +429,14 @@ async fn regulated_retention_coalesces_corrections_at_the_status_deadline() {
             .is_err(),
         "range corrections must obey the shared Status cadence"
     );
-    let latest = time::timeout(
-        Duration::from_secs(3),
-        wait_for_outbound_status(&mut outbound),
-    )
-    .await
-    .expect("the latest range is sent at the 30-second deadline");
+    // Read directly so the helper's one-second timeout cannot race the cadence deadline.
+    let frame = time::timeout(Duration::from_secs(3), outbound.recv())
+        .await
+        .expect("the latest range is sent at the 30-second deadline")
+        .expect("the outbound stream stays open");
+    let BlockSyncMessage::Status(latest) = BlockSyncMessage::decode_frame(frame).unwrap() else {
+        panic!("the retained-range correction is a Status");
+    };
     assert_eq!(latest.servable_low, block::Height(3));
     assert_eq!(latest.servable_high, block::Height(4));
     assert!(time::timeout(Duration::from_millis(150), outbound.recv())
