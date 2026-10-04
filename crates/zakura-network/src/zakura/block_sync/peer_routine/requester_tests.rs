@@ -213,6 +213,122 @@ async fn authorized_block_and_exact_ending_complete_the_live_request() {
 }
 
 #[tokio::test]
+async fn local_finality_or_competing_receipt_keeps_the_original_response_authorized() {
+    for finalized in [true, false] {
+        let block: block::Block = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
+            .zcash_deserialize_into()
+            .unwrap();
+        let (mut routine, mut outbound, pool, connection) = requester_routine(block.hash());
+        let (body_sender, mut bodies) = mpsc::channel(1);
+        routine.sequencer_input = body_sender;
+        let (view_tx, view_rx) = watch::channel(*routine.sequencer_view.borrow());
+        routine.sequencer_view = view_rx;
+        routine.try_fill().await;
+        tokio::time::timeout(Duration::from_secs(1), outbound.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        if finalized {
+            let released = routine.work.advance_floor(block::Height(1));
+            routine.budget.release(released);
+            view_tx.send_modify(|view| view.download_floor = block::Height(1));
+            routine.gc_committed_outstanding();
+        } else {
+            // The shared work ledger records another peer's receipt before ours.
+            let released = routine.work.claim_received(block::Height(1));
+            routine.budget.release(released);
+        }
+        assert_eq!(pool.held(), 1);
+        routine
+            .handle_frame(
+                &mut block_sync_guard(),
+                BlockSyncMessage::Block(Arc::new(block))
+                    .encode_frame()
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            bodies.try_recv().is_err(),
+            "already satisfied work is not delivered twice"
+        );
+        routine
+            .handle_frame(
+                &mut block_sync_guard(),
+                BlockSyncMessage::BlocksDone {
+                    start_height: block::Height(1),
+                    returned: 1,
+                }
+                .encode_frame()
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(pool.held(), 0);
+        drop(routine);
+        assert!(!connection.is_cancelled());
+    }
+}
+
+#[tokio::test]
+async fn a_partial_ending_requeues_only_the_missing_suffix() {
+    let first: block::Block = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
+        .zcash_deserialize_into()
+        .unwrap();
+    let second: block::Block = zakura_test::vectors::BLOCK_MAINNET_2_BYTES
+        .zcash_deserialize_into()
+        .unwrap();
+    let (mut routine, mut outbound, pool, connection) = requester_routine(first.hash());
+    routine.max_blocks_per_response = 2;
+    routine.work.extend(
+        super::super::test_work_scope(),
+        [(
+            block::Height(2),
+            second.hash(),
+            BlockSizeEstimate::Confirmed(1000),
+        )],
+    );
+    let (sender, mut bodies) = mpsc::channel(2);
+    routine.sequencer_input = sender;
+    routine.try_fill().await;
+    let sent = tokio::time::timeout(Duration::from_secs(1), outbound.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        BlockSyncMessage::decode_frame(sent).unwrap(),
+        BlockSyncMessage::GetBlocks { count: 2, .. }
+    ));
+    routine
+        .handle_frame(
+            &mut block_sync_guard(),
+            BlockSyncMessage::Block(Arc::new(first))
+                .encode_frame()
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(bodies.try_recv().is_ok());
+    routine
+        .handle_frame(
+            &mut block_sync_guard(),
+            BlockSyncMessage::BlocksDone {
+                start_height: block::Height(1),
+                returned: 1,
+            }
+            .encode_frame()
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(!routine.work.pending_contains(block::Height(1)));
+    assert!(routine.work.pending_contains(block::Height(2)));
+    assert_eq!(pool.held(), 0);
+    drop(routine);
+    assert!(!connection.is_cancelled());
+}
+
+#[tokio::test]
 async fn local_session_share_leaves_entries_for_another_requester() {
     use super::super::regulated::live_requester::SESSION_RESERVATIONS;
 
