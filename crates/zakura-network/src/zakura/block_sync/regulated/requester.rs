@@ -50,7 +50,7 @@ struct Pending {
     received: usize,
     body_bytes: usize,
     max_body_bytes: u32,
-    abandoned_at: Option<Instant>,
+    retirement_started_at: Option<Instant>,
 }
 
 /// Each range owns one node pool entry and at most 128 expected hashes.
@@ -64,8 +64,8 @@ pub(super) struct Requester {
     reservations: Reservations<Height>,
     ranges: BTreeMap<Height, Pending>,
     next: HashMap<Hash, Height>,
-    // Only incomplete ranges and completed ranges blocking a retry need a timer.
-    abandoned: BTreeSet<(Instant, Height)>,
+    // Abandoned work and fully received ranges still waiting for an ending.
+    retiring: BTreeSet<(Instant, Height)>,
     awaiting_end: usize,
     capacity: usize,
 }
@@ -80,7 +80,7 @@ impl Requester {
             reservations: Reservations::new(RULES, capacity),
             ranges: BTreeMap::new(),
             next: HashMap::new(),
-            abandoned: BTreeSet::new(),
+            retiring: BTreeSet::new(),
             awaiting_end: 0,
             capacity,
         }
@@ -96,7 +96,7 @@ impl Requester {
 
     /// Old abandoned work must not pin a height forever while other work advances.
     pub(super) fn retirement_deadline(&self, grace: Duration) -> Option<Instant> {
-        self.abandoned.first().map(|(at, _)| *at + grace)
+        self.retiring.first().map(|(at, _)| *at + grace)
     }
 
     pub(super) fn endings_at_capacity(&self) -> bool {
@@ -113,8 +113,8 @@ impl Requester {
         {
             return false;
         }
-        if let Some(at) = pending.abandoned_at {
-            self.abandoned.insert((at, *start));
+        if let Some(at) = pending.retirement_started_at {
+            self.retiring.insert((at, *start));
         }
         true
     }
@@ -170,7 +170,7 @@ impl Requester {
                 received: 0,
                 body_bytes: 0,
                 max_body_bytes,
-                abandoned_at: None,
+                retirement_started_at: None,
             },
         );
         Ok(writer)
@@ -187,10 +187,10 @@ impl Requester {
     pub(super) fn abandon(&mut self, start: Height) {
         self.reservations.abandon(&start);
         if let Some(pending) = self.ranges.get_mut(&start) {
-            let at = *pending.abandoned_at.get_or_insert_with(Instant::now);
-            if pending.received < pending.expected.len() {
-                self.abandoned.insert((at, start));
-            }
+            let at = *pending
+                .retirement_started_at
+                .get_or_insert_with(Instant::now);
+            self.retiring.insert((at, start));
         }
     }
 
@@ -232,9 +232,12 @@ impl Requester {
             );
         } else {
             self.awaiting_end += 1;
-            if let Some(at) = pending.abandoned_at {
-                self.abandoned.remove(&(at, start));
-            }
+            // The ordered response must still end. Keep an earlier abandonment
+            // deadline, or start one when the last block is claimed.
+            let at = *pending
+                .retirement_started_at
+                .get_or_insert_with(Instant::now);
+            self.retiring.insert((at, start));
         }
         Ok((height, claimed))
     }
@@ -267,8 +270,8 @@ impl Requester {
             } else {
                 self.awaiting_end -= 1;
             }
-            if let Some(at) = pending.abandoned_at {
-                self.abandoned.remove(&(at, start));
+            if let Some(at) = pending.retirement_started_at {
+                self.retiring.remove(&(at, start));
             }
         }
     }

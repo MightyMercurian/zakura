@@ -315,3 +315,62 @@ async fn abandoned_height_closes_locally_and_can_be_requested_on_replacement() {
         }
     ));
 }
+
+#[tokio::test]
+async fn missing_endings_cannot_pin_the_pool_below_each_peers_limit() {
+    let block: block::Block = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
+        .zcash_deserialize_into()
+        .unwrap();
+    let response = BlockSyncMessage::Block(Arc::new(block.clone()))
+        .encode_frame()
+        .unwrap();
+    let pool = ReservationPool::new(3).unwrap();
+    let mut peers = Vec::new();
+    for _ in 0..3 {
+        let (mut routine, mut outbound, _, connection) =
+            requester_routine_with_pool(block.hash(), pool.clone());
+        let (bodies, mut received) = mpsc::channel(1);
+        routine.sequencer_input = bodies;
+        routine.try_fill().await;
+        tokio::time::timeout(Duration::from_secs(1), outbound.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        routine
+            .handle_frame(&mut block_sync_guard(), response.clone())
+            .await
+            .unwrap();
+        assert!(received.try_recv().is_ok());
+        assert!(!routine.requester.as_ref().unwrap().at_capacity());
+        peers.push((routine, outbound, connection));
+    }
+    assert!(
+        pool.try_entry().is_none(),
+        "all peers retain an unended exchange"
+    );
+    for (routine, outbound, connection) in peers {
+        let grace = routine.config.effective_liveness_timeout();
+        let deadline = routine
+            .requester
+            .as_ref()
+            .unwrap()
+            .retirement_deadline(grace)
+            .expect("the last block starts the missing-ending deadline");
+        assert!(routine
+            .check_request_liveness(deadline - Duration::from_nanos(1))
+            .is_ok());
+        assert!(matches!(
+            routine.check_request_liveness(deadline),
+            Err(SinkReject::Local(_))
+        ));
+        assert!(connection.is_cancelled());
+        drop(routine);
+        drop(outbound);
+    }
+    assert_eq!(
+        pool.held(),
+        0,
+        "retired sessions return authorization capacity"
+    );
+    assert!(pool.try_entry().is_some(), "another peer can make progress");
+}
