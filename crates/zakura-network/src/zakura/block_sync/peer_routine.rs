@@ -1401,7 +1401,10 @@ impl PeerRoutine {
         let local = self.retry_avoid.values().min().copied();
         let floor = self.registry.next_floor_avoid_deadline(&self.peer, now);
         let body = self.registry.next_body_retry_deadline(&self.peer, now);
-        [local, floor, body]
+        let ending = self.requester.as_ref().and_then(|requester| {
+            requester.retirement_deadline(self.config.effective_liveness_timeout())
+        });
+        [local, floor, body, ending]
             .into_iter()
             .flatten()
             .min()

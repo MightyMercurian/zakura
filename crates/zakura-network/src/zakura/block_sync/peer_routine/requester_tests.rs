@@ -112,12 +112,28 @@ async fn written_timeout_preserves_authorization_and_blocks_overlap_until_ending
         .retirement_deadline(grace)
         .unwrap();
     routine.retry_avoid.clear();
-    routine.window.disarm_liveness_after_progress_if_idle();
-    routine.try_fill().await;
+    routine.window.note_block_progress(Instant::now(), grace);
+    assert_eq!(routine.try_fill().await, Some(retirement));
     assert!(
         routine.window.outstanding.is_empty(),
         "the old range still authorizes a response"
     );
+    assert!(routine.work.pending_contains(block::Height(1)));
+    let before = routine.next_request_id.unwrap().get();
+    let (_input, recv) = crate::zakura::framed_channel(4);
+    routine.recv = recv;
+    let (_view, view_rx) = watch::channel(*routine.sequencer_view.borrow());
+    routine.sequencer_view = view_rx;
+    let mut guard = block_sync_guard();
+    let mut running = Box::pin(routine.run_inner(&mut guard));
+    // Re-poll a parked routine without new work or an ending. The initial BBR
+    // tick can trigger one extra fill, but there must be no take/return spin.
+    for _ in 0..100 {
+        assert!(futures::poll!(&mut running).is_pending());
+    }
+    drop(running);
+    assert!(routine.next_request_id.unwrap().get() - before <= 2);
+
     let ending = BlockSyncMessage::RangeUnavailable {
         start_height: block::Height(1),
         count: 1,
