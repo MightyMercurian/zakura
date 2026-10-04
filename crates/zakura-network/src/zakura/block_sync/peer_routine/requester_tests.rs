@@ -279,6 +279,7 @@ async fn a_partial_ending_requeues_only_the_missing_suffix() {
         .zcash_deserialize_into()
         .unwrap();
     let (mut routine, mut outbound, pool, connection) = requester_routine(first.hash());
+    routine.config.max_blocks_per_response = 2;
     routine.max_blocks_per_response = 2;
     routine.work.extend(
         super::super::test_work_scope(),

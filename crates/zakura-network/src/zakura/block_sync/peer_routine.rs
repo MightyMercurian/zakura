@@ -4189,10 +4189,8 @@ mod tests {
                 BufferedResponse::None | BufferedResponse::StatusOnly
             )
         {
-            if readmitted {
-                assert!(matches!(result, Err(SinkReject::Protocol(_))), "{result:?}");
-            } else {
-                assert!(matches!(result, Err(SinkReject::Local(_))), "{result:?}");
+            assert!(matches!(result, Err(SinkReject::Local(_))), "{result:?}");
+            if !readmitted {
                 assert!(matches!(
                     registry.admit_session(
                         &peer,
