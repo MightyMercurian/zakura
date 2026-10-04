@@ -138,6 +138,7 @@ fn encode_response(
         }
         sink.send(&Message::Block(bytes))
             .map_err(|error| ServeEnd::LocalFault(error.to_string()))?;
+        metrics::counter!("sync.block.body.served").increment(1);
         body_bytes += len;
         returned += 1;
     }
