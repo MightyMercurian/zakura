@@ -9,7 +9,6 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
     time::Instant,
 };
-use zakura_chain::serialization::ZcashDecoder;
 
 /// Maximum frame bytes for one stream-6 body frame plus protocol framing.
 ///
@@ -237,7 +236,6 @@ impl BlockSyncPeerSession {
 /// Native stream-6 block-sync service scaffold.
 #[derive(Debug)]
 pub(crate) struct BlockSyncService {
-    decoder: ZcashDecoder,
     inner: Arc<BlockSyncServiceInner>,
     service_demand:
         Option<watch::Receiver<zakura_node_services::sync_lifecycle::SyncServiceDemand>>,
@@ -328,17 +326,12 @@ impl BlockSyncServiceInner {
 }
 
 impl BlockSyncService {
-    pub(crate) fn new(config: ZakuraBlockSyncConfig, decoder: ZcashDecoder) -> Self {
-        Self::new_with_startup(BlockSyncStartup::inert(config), decoder)
+    pub(crate) fn new(config: ZakuraBlockSyncConfig) -> Self {
+        Self::new_with_startup(BlockSyncStartup::inert(config))
     }
 
-    pub(crate) fn new_with_handle(
-        config: ZakuraBlockSyncConfig,
-        handle: BlockSyncHandle,
-        decoder: ZcashDecoder,
-    ) -> Self {
+    pub(crate) fn new_with_handle(config: ZakuraBlockSyncConfig, handle: BlockSyncHandle) -> Self {
         Self {
-            decoder,
             inner: Arc::new(BlockSyncServiceInner {
                 status_senders: Default::default(),
                 requester_sessions: Default::default(),
@@ -364,7 +357,6 @@ impl BlockSyncService {
     pub(crate) fn new_with_header_tip(
         config: ZakuraBlockSyncConfig,
         header_tip: watch::Receiver<(block::Height, block::Hash)>,
-        decoder: ZcashDecoder,
     ) -> Self {
         let best_header_tip = *header_tip.borrow();
         let startup = BlockSyncStartup::new(
@@ -377,14 +369,13 @@ impl BlockSyncService {
             header_tip,
             config,
         );
-        Self::new_with_startup(startup, decoder)
+        Self::new_with_startup(startup)
     }
 
-    fn new_with_startup(startup: BlockSyncStartup, decoder: ZcashDecoder) -> Self {
+    fn new_with_startup(startup: BlockSyncStartup) -> Self {
         let config = startup.config.clone();
         let (handle, _actions, reactor_task) = spawn_block_sync_reactor(startup);
         Self {
-            decoder,
             inner: Arc::new(BlockSyncServiceInner {
                 status_senders: Default::default(),
                 requester_sessions: Default::default(),
@@ -424,7 +415,6 @@ impl BlockSyncService {
         });
         (
             Self {
-                decoder: ZcashDecoder::for_network(&zakura_chain::parameters::Network::Mainnet),
                 inner: Arc::new(BlockSyncServiceInner {
                     status_senders: Default::default(),
                     requester_sessions: Default::default(),
@@ -454,11 +444,7 @@ impl BlockSyncService {
         config: ZakuraBlockSyncConfig,
         handle: BlockSyncHandle,
     ) -> Self {
-        Self::new_with_handle(
-            config,
-            handle,
-            ZcashDecoder::for_network(&zakura_chain::parameters::Network::Mainnet),
-        )
+        Self::new_with_handle(config, handle)
     }
 
     pub(crate) fn with_service_demand(
@@ -829,7 +815,6 @@ impl Service for BlockSyncService {
         // the stream so frames are not silently mishandled and the lifecycle still
         // flows.
         let pipe = {
-            let decoder = self.decoder;
             let connection_cancel_token = connection_cancel_token.clone();
             let close_cause = close_cause.clone();
             let routine_wiring = self.inner.routine_wiring.clone();
@@ -857,7 +842,6 @@ impl Service for BlockSyncService {
                             )
                         });
                         let routine = super::peer_routine::PeerRoutine::new(
-                            decoder,
                             peer_id,
                             conn_id,
                             block_sync_session,
