@@ -99,7 +99,10 @@ fn fake_blocks_in_range(start: u32, end: u32) -> Vec<Arc<block::Block>> {
         .collect()
 }
 
-fn fake_block_at_height(template: &Arc<block::Block>, height: block::Height) -> Arc<block::Block> {
+pub(super) fn fake_block_at_height(
+    template: &Arc<block::Block>,
+    height: block::Height,
+) -> Arc<block::Block> {
     let mut block = template.as_ref().clone();
 
     let mut coinbase = block.transactions[0].clone();
