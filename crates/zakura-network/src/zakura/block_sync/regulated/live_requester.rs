@@ -59,7 +59,26 @@ pub(crate) struct LiveRequester {
     fence: WriterFence,
 }
 
+/// One local wait in the session reader. These waits must not overlap.
+pub(crate) struct ReadPause {
+    shared: Arc<Shared>,
+    started: tokio::time::Instant,
+}
+
+impl Drop for ReadPause {
+    fn drop(&mut self) {
+        self.shared.lock().credit_read_pause(self.started.elapsed());
+    }
+}
+
 impl LiveRequester {
+    pub(crate) fn pause_reading(&self) -> ReadPause {
+        ReadPause {
+            shared: self.shared.clone(),
+            started: tokio::time::Instant::now(),
+        }
+    }
+
     pub(crate) fn new(
         pool: ReservationPool,
         fence: WriterFence,

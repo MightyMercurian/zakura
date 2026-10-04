@@ -532,3 +532,53 @@ async fn missing_endings_cannot_pin_the_pool_below_each_peers_limit() {
     );
     assert!(pool.try_entry().is_some(), "another peer can make progress");
 }
+
+#[tokio::test(start_paused = true)]
+async fn buffered_ending_survives_a_long_local_decode_wait() {
+    let block: block::Block = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
+        .zcash_deserialize_into()
+        .unwrap();
+    let (mut routine, mut outbound, pool, connection) = requester_routine(block.hash());
+    let (bodies, mut received) = mpsc::channel(1);
+    let held = bodies.clone().try_reserve_owned().unwrap();
+    routine.sequencer_input = bodies;
+    routine.try_fill().await;
+    outbound.recv().await.unwrap();
+    let (input, mut buffered) = crate::zakura::framed_channel(1);
+    input
+        .send(
+            BlockSyncMessage::BlocksDone {
+                start_height: block::Height(1),
+                returned: 1,
+            }
+            .encode_frame()
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    let before = Instant::now();
+    let mut guard = block_sync_guard();
+    let mut processing = Box::pin(
+        routine.handle_frame(
+            &mut guard,
+            BlockSyncMessage::Block(Arc::new(block))
+                .encode_frame()
+                .unwrap(),
+        ),
+    );
+    assert!(futures::poll!(&mut processing).is_pending());
+    time::advance(Duration::from_secs(40)).await;
+    drop(held);
+    processing.await.unwrap();
+    received.try_recv().unwrap();
+    assert!(routine
+        .check_request_liveness(before + Duration::from_secs(40))
+        .is_ok());
+    assert!(!connection.is_cancelled());
+    routine
+        .handle_frame(&mut block_sync_guard(), buffered.recv().await.unwrap())
+        .await
+        .unwrap();
+    assert_eq!(pool.held(), 0);
+    assert!(!connection.is_cancelled());
+}

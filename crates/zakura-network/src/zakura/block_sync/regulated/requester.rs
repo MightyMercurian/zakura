@@ -66,6 +66,7 @@ pub(super) struct Requester {
     next: HashMap<Hash, Height>,
     // Abandoned work and fully received ranges still waiting for an ending.
     retiring: BTreeSet<(Instant, Height)>,
+    read_paused: Duration,
     awaiting_end: usize,
     capacity: usize,
 }
@@ -81,6 +82,7 @@ impl Requester {
             ranges: BTreeMap::new(),
             next: HashMap::new(),
             retiring: BTreeSet::new(),
+            read_paused: Duration::ZERO,
             awaiting_end: 0,
             capacity,
         }
@@ -96,7 +98,15 @@ impl Requester {
 
     /// Old abandoned work must not pin a height forever while other work advances.
     pub(super) fn retirement_deadline(&self, grace: Duration) -> Option<Instant> {
-        self.retiring.first().map(|(at, _)| *at + grace)
+        self.retiring
+            .first()
+            .map(|(at, _)| *at + grace + self.read_paused)
+    }
+
+    /// Local waits stop reading endings. Keep the timer in read-active time
+    /// without walking every pending request after each wait.
+    pub(super) fn credit_read_pause(&mut self, elapsed: Duration) {
+        self.read_paused += elapsed;
     }
 
     pub(super) fn endings_at_capacity(&self) -> bool {
@@ -185,11 +195,10 @@ impl Requester {
 
     /// A scheduler timeout changes local interest, never the peer's authority.
     pub(super) fn abandon(&mut self, start: Height) {
+        let now = Instant::now() - self.read_paused;
         self.reservations.abandon(&start);
         if let Some(pending) = self.ranges.get_mut(&start) {
-            let at = *pending
-                .retirement_started_at
-                .get_or_insert_with(Instant::now);
+            let at = *pending.retirement_started_at.get_or_insert(now);
             self.retiring.insert((at, start));
         }
     }
@@ -208,6 +217,7 @@ impl Requester {
         hash: Hash,
         payload_len: usize,
     ) -> Result<(Height, Claimed), ResponseError> {
+        let now = Instant::now() - self.read_paused;
         let start = *self.next.get(&hash).ok_or(ResponseError::Identity)?;
         let pending = self
             .ranges
@@ -234,9 +244,7 @@ impl Requester {
             self.awaiting_end += 1;
             // The ordered response must still end. Keep an earlier abandonment
             // deadline, or start one when the last block is claimed.
-            let at = *pending
-                .retirement_started_at
-                .get_or_insert_with(Instant::now);
+            let at = *pending.retirement_started_at.get_or_insert(now);
             self.retiring.insert((at, start));
         }
         Ok((height, claimed))

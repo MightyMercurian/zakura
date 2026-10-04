@@ -728,6 +728,10 @@ impl PeerRoutine {
     async fn reserve_body_decode_permit(
         &self,
     ) -> Result<mpsc::OwnedPermit<SequencedBody>, SinkReject> {
+        let _read_pause = self
+            .requester
+            .as_ref()
+            .map(|requester| requester.pause_reading());
         let capacity_before = self.sequencer_input.capacity();
         let started = Instant::now();
         let permit = self
@@ -1982,6 +1986,10 @@ impl PeerRoutine {
             permit.send(body);
             true
         } else {
+            let _read_pause = self
+                .requester
+                .as_ref()
+                .map(|requester| requester.pause_reading());
             let send_result = self.sequencer_input.send(body).await;
             send_result.is_ok()
         };
