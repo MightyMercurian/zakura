@@ -608,3 +608,25 @@ async fn a_timed_out_read_keeps_the_same_peer_budget_after_its_output_drains() {
         "a reconnect must find the still-running peer execution budget"
     );
 }
+
+#[tokio::test]
+async fn queued_getblocks_commitments_have_a_measured_memory_ceiling() {
+    let config = super::super::ZakuraBlockSyncConfig::default();
+    let serving = super::session::Serving::new(store(&[], false), &config);
+    let (send, _output) = framed_channel(4);
+    let cancel = CancellationToken::new();
+    let peer = ZakuraPeerId::new(vec![91; 32]).unwrap();
+    let mut session = serving.session(&peer, send, cancel.clone());
+    let count = config.advertised_max_inflight_requests() * 2;
+    let (_, allocations) = zakura_test::allocations::measure(|| {
+        for height in 1..=count {
+            session.admit(block::Height(height), 1).unwrap();
+        }
+    });
+    assert!(
+        allocations.retained_bytes < usize::try_from(count).unwrap() * 1_024,
+        "{allocations:?}"
+    );
+    eprintln!("GetBlocks waiting commitments={count}, {allocations:?}");
+    cancel.cancel();
+}
