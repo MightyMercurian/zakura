@@ -16,3 +16,5 @@ pub(super) mod wire;
 mod requester_tests;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod wire_tests;
