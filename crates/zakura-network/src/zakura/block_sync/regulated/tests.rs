@@ -611,22 +611,48 @@ async fn a_timed_out_read_keeps_the_same_peer_budget_after_its_output_drains() {
 
 #[tokio::test]
 async fn queued_getblocks_commitments_have_a_measured_memory_ceiling() {
+    measure_waiting_getblocks_sessions(1);
+}
+
+#[tokio::test]
+#[ignore = "manual load measurement: retains tens of GB at the current defaults"]
+async fn maximum_admitted_getblocks_sessions_have_a_measured_memory_ceiling() {
+    let peers = super::super::ZakuraBlockSyncConfig::default().peer_limits;
+    measure_waiting_getblocks_sessions(peers.max_inbound_peers + peers.max_outbound_peers);
+}
+
+#[allow(clippy::print_stderr)] // Manual load runs report measured bytes and admission time.
+fn measure_waiting_getblocks_sessions(peers: usize) {
     let config = super::super::ZakuraBlockSyncConfig::default();
     let serving = super::session::Serving::new(store(&[], false), &config);
-    let (send, _output) = framed_channel(4);
     let cancel = CancellationToken::new();
-    let peer = ZakuraPeerId::new(vec![91; 32]).unwrap();
-    let mut session = serving.session(&peer, send, cancel.clone());
     let count = config.advertised_max_inflight_requests() * 2;
-    let (_, allocations) = zakura_test::allocations::measure(|| {
-        for height in 1..=count {
-            session.admit(block::Height(height), 1).unwrap();
-        }
+    let started = std::time::Instant::now();
+    // No await: all requests remain queued before any worker can run. Output
+    // receivers stay alive so closed queues cannot hide the retained cost.
+    let (sessions, allocations) = zakura_test::allocations::measure(|| {
+        (0..peers)
+            .map(|index| {
+                let mut identity = vec![91; 32];
+                identity[..8].copy_from_slice(&u64::try_from(index).unwrap().to_le_bytes());
+                let peer = ZakuraPeerId::new(identity).unwrap();
+                let (send, output) = framed_channel(4);
+                let mut session = serving.session(&peer, send, cancel.clone());
+                for height in 1..=count {
+                    session.admit(block::Height(height), 1).unwrap();
+                }
+                (session, output)
+            })
+            .collect::<Vec<_>>()
     });
     assert!(
-        allocations.retained_bytes < usize::try_from(count).unwrap() * 1_024,
+        allocations.retained_bytes < peers * usize::try_from(count).unwrap() * 1_024,
         "{allocations:?}"
     );
-    eprintln!("GetBlocks waiting commitments={count}, {allocations:?}");
+    eprintln!(
+        "GetBlocks peers={peers}, waiting per peer={count}, admission time={:?}, {allocations:?}",
+        started.elapsed()
+    );
     cancel.cancel();
+    drop(sessions);
 }
