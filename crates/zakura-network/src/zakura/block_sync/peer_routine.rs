@@ -1599,7 +1599,7 @@ impl PeerRoutine {
                 outstanding = self.window.outstanding.len(),
                 "disconnecting Zakura block-sync peer after repeated no-progress stall"
             );
-            return Err(SinkReject::protocol(error));
+            return Err(SinkReject::local(error));
         }
         self.registry.park_session(
             &self.peer,
@@ -4370,5 +4370,15 @@ mod tests {
             super::no_progress_response(false),
             super::NoProgressResponse::Disconnect
         );
+    }
+
+    #[tokio::test]
+    async fn repeated_no_progress_is_a_local_failure() {
+        let (mut routine, _outbound, _events) = status_test_routine();
+        routine.allow_no_progress_park = false;
+        assert!(matches!(
+            routine.no_progress_stall(Instant::now(), "stalled"),
+            Err(SinkReject::Local(_))
+        ));
     }
 }
