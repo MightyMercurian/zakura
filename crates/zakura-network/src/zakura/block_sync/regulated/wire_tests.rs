@@ -65,6 +65,6 @@ proptest! {
         payload.extend(tail);
         let (result, allocations) = zakura_test::allocations::measure(|| BlockSyncMessage::decode(&payload));
         prop_assert!(result.is_err());
-        prop_assert!(allocations.largest_request < 8_192, "{allocations:?}");
+        prop_assert!(allocations.largest_request < 8_192, "{:?}", allocations);
     }
 }
