@@ -169,7 +169,7 @@ async fn unwritten_timeout_retracts_authorization_without_closing_connection() {
 
 #[tokio::test]
 async fn wrong_header_is_rejected_before_transaction_decoding_or_decode_capacity() {
-    let (mut routine, mut outbound, _pool, _connection) = requester_routine(block::Hash([1; 32]));
+    let (mut routine, mut outbound, pool, connection) = requester_routine(block::Hash([1; 32]));
     routine.try_fill().await;
     tokio::time::timeout(Duration::from_secs(1), outbound.recv())
         .await
@@ -193,7 +193,32 @@ async fn wrong_header_is_rejected_before_transaction_decoding_or_decode_capacity
         )
         .await
         .unwrap_err();
+    assert!(matches!(error, SinkReject::Local(_)));
     assert!(error.to_string().contains("next expected header"));
+    assert!(connection.is_cancelled());
+    assert_eq!(
+        pool.held(),
+        1,
+        "retirement keeps authorization until cleanup"
+    );
+    let registry = routine.registry.clone();
+    let peer = routine.peer.clone();
+    let work = routine.work.clone();
+    drop(routine);
+    assert!(work.pending_contains(block::Height(1)));
+    registry.remove(&peer);
+    assert!(registry.is_body_retry_avoided(
+        &peer,
+        super::super::test_work_scope(),
+        block::Hash([1; 32]),
+        Instant::now()
+    ));
+    assert!(!registry.is_body_retry_avoided(
+        &peer,
+        super::super::test_work_scope(),
+        block::Hash([2; 32]),
+        Instant::now()
+    ));
 }
 
 #[tokio::test]

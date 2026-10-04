@@ -1129,12 +1129,17 @@ impl WorkQueue {
     /// Expected hash for a height in `pending` or `in_flight` (late-response
     /// recovery).
     pub(super) fn hash_for_height(&self, height: block::Height) -> Option<block::Hash> {
+        self.item_for_height(height).map(|item| item.hash)
+    }
+
+    /// Current authority and identity, including work returned by a timed-out request.
+    pub(super) fn item_for_height(&self, height: block::Height) -> Option<WorkItem> {
         let inner = self.lock();
         inner
             .pending
             .get(&height)
             .or_else(|| inner.in_flight.get(&height))
-            .map(|item| item.hash)
+            .copied()
     }
 
     /// Active request owner for a height, if it is currently reserved.

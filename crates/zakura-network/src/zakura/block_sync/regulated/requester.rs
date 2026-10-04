@@ -88,6 +88,17 @@ impl Requester {
         }
     }
 
+    pub(super) fn next_expected(&self) -> Vec<(Height, Hash)> {
+        self.next
+            .iter()
+            .map(|(hash, start)| {
+                let pending = &self.ranges[start];
+                // Received never exceeds the protocol's 128-block request limit.
+                (Height(start.0 + pending.received as u32), *hash)
+            })
+            .collect()
+    }
+
     pub(super) fn len(&self) -> usize {
         self.reservations.len()
     }

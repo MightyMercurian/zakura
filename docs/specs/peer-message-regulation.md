@@ -724,8 +724,12 @@ and terminal response match exactly one range despite version 2's missing reques
 
 The receiver matches a `Block` by hashing its header and comparing that hash with the committed
 header hashes expected by live ranges. A block that does not match the next expected hash of exactly
-one live range MUST return `Disconnect`. The publisher MUST send the blocks of a range in ascending
-height order. The reservation identity commits to a header that header sync already validated, so
+one live range MUST retire the connection as a local incompatibility, without a peer-fault
+report or penalty. Height-only requests do not commit the publisher to the requester's chain.
+The receiver MUST retain the exchange fences until connection cleanup and requeue unreceived work.
+It SHOULD briefly avoid this supplier for the still-wanted next bodies, including across reconnects,
+without delaying other suppliers. Invalid framing, excess response bytes, and invalid endings remain
+protocol violations. The publisher MUST send the blocks of a range in ascending height order. The reservation identity commits to a header that header sync already validated, so
 Verify re-checks Equihash and the target only as defense in depth. An implementation MAY skip both
 checks when the header bytes hash to the expected identity. Block sync takes that option today: it
 matches the hash at [`peer_routine`][bs-expected-hash] and leaves

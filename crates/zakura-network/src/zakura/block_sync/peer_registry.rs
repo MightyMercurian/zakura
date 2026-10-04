@@ -129,6 +129,15 @@ impl SessionAdmission {
 }
 
 #[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
+enum BodyRetryReason {
+    Unavailable,
+    Incompatible,
+}
+
+type SupplierRetries =
+    HashMap<(zakura_header_chain::SourceId, BodyRetryKey, BodyRetryReason), Instant>;
+
+#[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
 struct BodyRetryKey {
     header_generation: zakura_header_chain::HeaderGeneration,
     branch: zakura_header_chain::BranchId,
@@ -194,7 +203,7 @@ pub(super) struct PeerRegistry {
     peers: StdMutex<HashMap<ZakuraPeerId, Entry>>,
     floor_ranking_changed: Notify,
     session_parks: StdMutex<HashMap<ZakuraPeerId, SessionPark>>,
-    body_retry_avoid: StdMutex<HashMap<(zakura_header_chain::SourceId, BodyRetryKey), Instant>>,
+    body_retry_avoid: StdMutex<SupplierRetries>,
     body_retry_all: StdMutex<HashMap<BodyRetryKey, Instant>>,
     /// Source of monotonically-increasing routine generations.
     next_generation: std::sync::atomic::AtomicU64,
@@ -247,9 +256,34 @@ impl PeerRegistry {
         let key = BodyRetryKey::new(scope, hash);
         let sources: std::collections::BTreeSet<_> = sources.into_iter().collect();
         let mut retries = self.body_retry_lock();
-        retries.retain(|(source, candidate), _| *candidate != key || sources.contains(source));
+        retries.retain(|(source, candidate, reason), _| {
+            *reason != BodyRetryReason::Unavailable || *candidate != key || sources.contains(source)
+        });
         for source in sources {
-            retries.insert((source, key), until);
+            retries.insert((source, key, BodyRetryReason::Unavailable), until);
+        }
+    }
+
+    /// A local compatibility cooldown must not replace the sequencer's retry episode.
+    pub(super) fn defer_incompatible_bodies(
+        &self,
+        source: zakura_header_chain::SourceId,
+        bodies: impl IntoIterator<Item = (zakura_header_chain::BodyWorkAuthority, block::Hash)>,
+        until: Instant,
+    ) {
+        let mut retries = self.body_retry_lock();
+        let now = Instant::now();
+        retries.retain(|_, deadline| *deadline > now);
+        for (scope, hash) in bodies {
+            let key = (
+                source,
+                BodyRetryKey::new(scope, hash),
+                BodyRetryReason::Incompatible,
+            );
+            retries
+                .entry(key)
+                .and_modify(|deadline| *deadline = (*deadline).max(until))
+                .or_insert(until);
         }
     }
 
@@ -271,7 +305,7 @@ impl PeerRegistry {
     ) {
         let key = BodyRetryKey::new(scope, hash);
         self.body_retry_lock()
-            .retain(|(_, candidate), _| *candidate != key);
+            .retain(|(_, candidate, _), _| *candidate != key);
         self.body_retry_all_lock().remove(&key);
     }
 
@@ -279,7 +313,7 @@ impl PeerRegistry {
         &self,
         current: Option<zakura_header_chain::BodyWorkAuthority>,
     ) {
-        self.body_retry_lock().retain(|(_, key), _| {
+        self.body_retry_lock().retain(|(_, key, _), _| {
             current.is_some_and(|scope| {
                 key.header_generation == scope.header_generation
                     && key.branch == scope.branch
@@ -316,11 +350,11 @@ impl PeerRegistry {
             .collect();
         *retries = std::mem::take(&mut *retries)
             .into_iter()
-            .map(|((source, mut key), deadline)| {
+            .map(|((source, mut key, reason), deadline)| {
                 key.header_generation = current.header_generation;
                 key.branch = current.branch;
                 key.body_work_epoch = current.body_work_epoch;
-                ((source, key), deadline)
+                ((source, key, reason), deadline)
             })
             .collect();
     }
@@ -341,9 +375,13 @@ impl PeerRegistry {
         }
         let mut retries = self.body_retry_lock();
         retries.retain(|_, until| *until > now);
-        retries
-            .get(&(source, key))
-            .is_some_and(|until| *until > now)
+        [BodyRetryReason::Unavailable, BodyRetryReason::Incompatible]
+            .into_iter()
+            .any(|reason| {
+                retries
+                    .get(&(source, key, reason))
+                    .is_some_and(|until| *until > now)
+            })
     }
 
     /// Return whether this peer still has a live backoff for `hash` under any authority.
@@ -369,7 +407,7 @@ impl PeerRegistry {
         retries.retain(|_, until| *until > now);
         retries
             .keys()
-            .any(|(candidate, key)| *candidate == source && key.hash == hash)
+            .any(|(candidate, key, _)| *candidate == source && key.hash == hash)
     }
 
     pub(super) fn next_body_retry_deadline(
@@ -387,7 +425,7 @@ impl PeerRegistry {
         retries.retain(|_, until| *until > now);
         let source_deadline = retries
             .iter()
-            .filter_map(|((candidate, _), until)| (*candidate == source).then_some(*until))
+            .filter_map(|((candidate, _, _), until)| (*candidate == source).then_some(*until))
             .min();
         all_deadline.into_iter().chain(source_deadline).min()
     }
@@ -398,10 +436,7 @@ impl PeerRegistry {
             .expect("peer registry mutex is never poisoned")
     }
 
-    fn body_retry_lock(
-        &self,
-    ) -> std::sync::MutexGuard<'_, HashMap<(zakura_header_chain::SourceId, BodyRetryKey), Instant>>
-    {
+    fn body_retry_lock(&self) -> std::sync::MutexGuard<'_, SupplierRetries> {
         self.body_retry_avoid
             .lock()
             .expect("body retry registry mutex is never poisoned")
@@ -1285,6 +1320,32 @@ mod floor_bias_tests {
             "refreshing supplier-specific deferrals must not reopen a durable alarm"
         );
         assert!(reg.is_body_retry_avoided(&second, scope, hash, now));
+    }
+
+    #[test]
+    fn incompatibility_cooldown_preserves_supplier_retries_and_survives_episode_refresh() {
+        let reg = PeerRegistry::new();
+        let scope = super::super::test_work_scope();
+        let hash = block::Hash([8; 32]);
+        let (first, second) = (peer(1), peer(2));
+        let now = Instant::now();
+        let until = now + std::time::Duration::from_secs(32);
+        let second_source = zakura_header_chain::SourceId::from_digest(second.digest());
+        reg.defer_body_retry([second_source], scope, hash, until);
+        reg.defer_incompatible_bodies(
+            zakura_header_chain::SourceId::from_digest(first.digest()),
+            [(scope, hash)],
+            until,
+        );
+        assert!(reg.is_body_retry_avoided(&second, scope, hash, now));
+        // The sequencer may refresh the retry episode without knowing about
+        // this connection's compatibility decision.
+        reg.defer_body_retry([second_source], scope, hash, until);
+        reg.remove(&first);
+        assert!(reg.is_body_retry_avoided(&first, scope, hash, now));
+        assert!(reg.is_body_retry_avoided(&second, scope, hash, now));
+        assert!(!reg.is_body_retry_avoided(&first, scope, hash, until));
+        assert!(!reg.is_body_retry_avoided(&second, scope, hash, until));
     }
 
     #[test]

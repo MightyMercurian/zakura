@@ -7,7 +7,7 @@ use std::{
 use zakura_chain::{block, serialization::ZcashDeserialize};
 
 use super::{
-    requester::Requester,
+    requester::{Requester, ResponseError},
     wire::{Message, Range, RULES},
 };
 use crate::zakura::{
@@ -51,6 +51,12 @@ impl ResponsePrecheck for Shared {
             _ => FrameRejection::Unsolicited,
         })
     }
+}
+
+pub(crate) enum Authorization {
+    Control,
+    Block(block::Height),
+    IncompatibleHeader,
 }
 
 pub(crate) struct LiveRequester {
@@ -97,6 +103,10 @@ impl LiveRequester {
             pool,
             fence,
         }
+    }
+
+    pub(crate) fn next_expected(&self) -> Vec<(block::Height, block::Hash)> {
+        self.shared.lock().next_expected()
     }
 
     pub(crate) fn len(&self) -> usize {
@@ -159,7 +169,7 @@ impl LiveRequester {
 
     /// Authorize the exact header before decoding the block's transactions.
     /// Endings are small and must validate before their reservation is removed.
-    pub(crate) fn authorize(&self, frame: &Frame) -> Result<Option<block::Height>, SinkReject> {
+    pub(crate) fn authorize(&self, frame: &Frame) -> Result<Authorization, SinkReject> {
         let rule = MessageRule::find(RULES, frame.message_type)
             .ok_or_else(|| SinkReject::protocol("unknown GetBlocks message"))?;
         if frame.flags != 0
@@ -175,12 +185,18 @@ impl LiveRequester {
                 .map_err(SinkReject::protocol)?;
             let header = block::Header::zcash_deserialize(&frame.payload[1..])
                 .map_err(SinkReject::protocol)?;
-            let (height, _) = self
+            let result = self
                 .shared
                 .lock()
-                .claim_block(header.hash(), frame.payload.len())
-                .map_err(SinkReject::protocol)?;
-            return Ok(Some(height));
+                .claim_block(header.hash(), frame.payload.len());
+            return match result {
+                Ok((height, _)) => Ok(Authorization::Block(height)),
+                Err(ResponseError::Identity) => {
+                    self.fence.retire();
+                    Ok(Authorization::IncompatibleHeader)
+                }
+                Err(error) => Err(SinkReject::protocol(error)),
+            };
         }
         let message: Message = decode_frame(frame).map_err(SinkReject::protocol)?;
         if matches!(frame.message_type, 4 | 5) {
@@ -189,7 +205,7 @@ impl LiveRequester {
                 .finish(&message)
                 .map_err(SinkReject::protocol)?;
         }
-        Ok(None)
+        Ok(Authorization::Control)
     }
 
     pub(crate) fn ending_start(message: &BlockSyncMessage) -> Option<block::Height> {
