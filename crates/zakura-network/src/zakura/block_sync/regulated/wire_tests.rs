@@ -9,7 +9,7 @@ use zakura_chain::{
 use super::wire::{Message, Range};
 use crate::zakura::{
     block_sync::{BlockSyncMessage, BlockSyncStatus},
-    wire_codec::{decode_frame, encode_frame, message_suite::check_payload},
+    wire_codec::{decode_frame, encode_frame, message_suite::decode_checked},
 };
 
 proptest! {
@@ -46,9 +46,14 @@ proptest! {
     #[test]
     fn hostile_stream_six_payloads_do_not_panic_or_exceed_envelope_allocations(
         kind in 1u16..=5,
-        payload in proptest::collection::vec(any::<u8>(), 0..4_096),
+        body in proptest::collection::vec(any::<u8>(), 0..4_096),
     ) {
-        check_payload::<Message>(kind, payload.clone());
+        let mut payload = vec![u8::try_from(kind).unwrap()];
+        payload.extend(body);
+        let frame = crate::zakura::Frame { message_type: kind, flags: 0, payload: payload.clone() };
+        if let Ok(message) = decode_checked::<Message>(&frame) {
+            prop_assert_eq!(encode_frame(&message).unwrap().payload, payload.clone());
+        }
         // This also exercises nested block decoding when the discriminator is 3.
         let _ = BlockSyncMessage::decode(&payload);
     }
