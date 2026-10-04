@@ -6383,8 +6383,8 @@ fn block_sync_stream_declares_kind_capability_version_and_frame_cap() {
         .expect("block sync declares one stream");
 
     assert_eq!(stream.kind, ZAKURA_STREAM_BLOCK_SYNC);
-    assert_eq!(stream.version, ZAKURA_BLOCK_SYNC_STREAM_VERSION);
-    assert_eq!(stream.capability, ZAKURA_CAP_BLOCK_SYNC);
+    assert_eq!(stream.version, ZAKURA_REGULATED_BLOCK_SYNC_STREAM_VERSION);
+    assert_eq!(stream.capability, ZAKURA_CAP_BLOCK_SYNC_REGULATED);
     assert_eq!(stream.mode, StreamMode::Persistent);
     assert_eq!(stream.frame_cap, MAX_BS_FRAME_BYTES);
 }

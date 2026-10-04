@@ -394,7 +394,8 @@ impl Drop for LiveServing {
 fn live_serving(source: Arc<Store>, max_bytes: u32) -> LiveServing {
     use crate::zakura::{
         BlockSyncService, Peer, Service, ServicePeerDirection, ZakuraBlockSyncConfig,
-        ZAKURA_CAP_BLOCK_SYNC, ZAKURA_STREAM_BLOCK_SYNC,
+        ZAKURA_CAP_BLOCK_SYNC_REGULATED, ZAKURA_REGULATED_BLOCK_SYNC_STREAM_VERSION,
+        ZAKURA_STREAM_BLOCK_SYNC,
     };
     let config = ZakuraBlockSyncConfig {
         max_response_bytes: max_bytes,
@@ -418,13 +419,24 @@ fn live_serving(source: Arc<Store>, max_bytes: u32) -> LiveServing {
     let (input, recv) = framed_channel(4);
     let (send, output) = framed_channel(4);
     let send = send.with_session_resources(Some(resources));
-    service.add_peer(Peer::new_with_direction(
+    service.add_peer(Peer::new_with_service_streams(
+        0,
         ZakuraPeerId::new(vec![11; 32]).unwrap(),
         None,
-        ZAKURA_CAP_BLOCK_SYNC,
+        ZAKURA_CAP_BLOCK_SYNC_REGULATED,
         ServicePeerDirection::Outbound,
-        std::collections::HashMap::from([(ZAKURA_STREAM_BLOCK_SYNC, (recv, send))]),
+        std::collections::HashMap::from([(
+            ZAKURA_STREAM_BLOCK_SYNC,
+            crate::zakura::transport::ServiceStream::new(
+                0,
+                ZAKURA_REGULATED_BLOCK_SYNC_STREAM_VERSION,
+                recv,
+                send,
+                cancel.child_token(),
+            ),
+        )]),
         cancel.clone(),
+        crate::zakura::CloseCause::default(),
     ));
     LiveServing {
         service,

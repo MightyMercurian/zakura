@@ -244,7 +244,8 @@ Remove the mandatory push deadline. The publisher produces eligible pages when c
 and capacity are available. The subscriber can track progress and select another peer under local
 policy. Slow progress alone is not a protocol violation. Idle subscription state stays bounded.
 
-Block sync retains version-2 correlation rules. Live ranges cannot overlap on one connection because
+Regulated block sync negotiates version 3 with version-2 message encodings. Live ranges cannot
+overlap on one regulated connection because
 the wire format lacks a request ID. BlocksDone and RangeUnavailable close the matching range once.
 A separate successor protocol can improve correlation later.
 

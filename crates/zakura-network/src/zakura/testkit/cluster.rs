@@ -1096,12 +1096,18 @@ mod tests {
     #[tokio::test]
     async fn native_block_sync_getblocks_flushes_before_hostile_peer_sends_bodies(
     ) -> Result<(), BoxError> {
-        native_getblocks_exchange(false).await
+        native_getblocks_exchange(false, false).await
     }
 
     #[tokio::test]
     async fn regulated_getblocks_serves_and_receives_over_native_quic() -> Result<(), BoxError> {
-        native_getblocks_exchange(true).await
+        native_getblocks_exchange(true, false).await
+    }
+
+    #[tokio::test]
+    async fn upgraded_node_downloads_from_a_mostly_old_peer_set_without_endings(
+    ) -> Result<(), BoxError> {
+        native_getblocks_exchange(true, true).await
     }
 
     #[derive(Debug)]
@@ -1145,7 +1151,21 @@ mod tests {
         }
     }
 
-    async fn native_getblocks_exchange(regulated: bool) -> Result<(), BoxError> {
+    async fn native_getblocks_exchange(regulated: bool, mostly_old: bool) -> Result<(), BoxError> {
+        use crate::zakura::{
+            ZAKURA_CAP_BLOCK_SYNC_REGULATED, ZAKURA_REGULATED_BLOCK_SYNC_STREAM_VERSION,
+        };
+        let regulated_peer = regulated && !mostly_old;
+        let version = if regulated_peer {
+            ZAKURA_REGULATED_BLOCK_SYNC_STREAM_VERSION
+        } else {
+            crate::zakura::ZAKURA_BLOCK_SYNC_STREAM_VERSION
+        };
+        let capabilities = if regulated_peer {
+            ZAKURA_CAP_BLOCK_SYNC_REGULATED
+        } else {
+            ZAKURA_CAP_BLOCK_SYNC
+        };
         let _guard = zakura_test::init();
         let mut capture = TraceCapture::for_test_with_keep_override(
             if regulated {
@@ -1172,7 +1192,11 @@ mod tests {
         let block_sync_config = ZakuraBlockSyncConfig {
             max_blocks_per_response: 3,
             max_inflight_block_bytes: u64::MAX,
-            request_timeout: Duration::from_secs(300),
+            request_timeout: if mostly_old {
+                Duration::from_millis(500)
+            } else {
+                Duration::from_secs(300)
+            },
             peer_limits: ServicePeerLimits {
                 inbound_queue_depth: 1,
                 outbound_queue_depth: 1,
@@ -1219,7 +1243,7 @@ mod tests {
         let submitted = Arc::new(StdMutex::new(Vec::new()));
         let driver =
             drive_native_block_sync_actions(victim, blocks.clone(), submitted.clone()).await;
-        let hostile = if regulated {
+        let hostile = if regulated_peer {
             // Each fixture block exceeds this receive window. Leaving the response
             // unread must stall the serving writer while downloads still progress.
             assert!(blocks.iter().all(|block| block_size(block) > 1024));
@@ -1227,21 +1251,47 @@ mod tests {
                 .stream_receive_window(iroh::endpoint::VarInt::from_u32(1024))
                 .receive_window(iroh::endpoint::VarInt::from_u32(2048))
                 .build();
-            HostilePeer::connect_native_with_transport(victim, 61, ZAKURA_CAP_BLOCK_SYNC, transport)
-                .await?
+            HostilePeer::connect_native_with_transport(victim, 61, capabilities, transport).await?
         } else {
-            HostilePeer::connect_native_with_capabilities(victim, 61, ZAKURA_CAP_BLOCK_SYNC).await?
+            HostilePeer::connect_native_with_capabilities(victim, 61, capabilities).await?
         };
+        let mut bystanders = Vec::new();
+        if mostly_old {
+            // Five old peers (including the body supplier), one upgraded peer.
+            for (seed, caps) in [
+                (62, ZAKURA_CAP_BLOCK_SYNC),
+                (63, ZAKURA_CAP_BLOCK_SYNC),
+                (64, ZAKURA_CAP_BLOCK_SYNC),
+                (65, ZAKURA_CAP_BLOCK_SYNC),
+                (66, ZAKURA_CAP_BLOCK_SYNC_REGULATED),
+            ] {
+                bystanders
+                    .push(HostilePeer::connect_native_with_capabilities(victim, seed, caps).await?);
+            }
+        }
         let hostile_peer = hostile.id()?;
         let peer_set = victim.supervisor().subscribe();
         await_until("block-sync peer registered", Duration::from_secs(5), || {
             peer_set.borrow().contains(&hostile_peer)
         })
         .await?;
+        if mostly_old {
+            let ids = bystanders
+                .iter()
+                .map(HostilePeer::id)
+                .collect::<Result<Vec<_>, _>>()?;
+            await_until(
+                "mostly old peer set registered",
+                Duration::from_secs(5),
+                || ids.iter().all(|id| peer_set.borrow().contains(id)),
+            )
+            .await?;
+        }
 
         hostile
-            .send_raw_frame(
+            .send_ordered_raw_frame_with_version(
                 ZAKURA_STREAM_BLOCK_SYNC,
+                version,
                 BlockSyncMessage::Status(BlockSyncStatus {
                     servable_low: block::Height(1),
                     servable_high: block::Height(3),
@@ -1256,7 +1306,9 @@ mod tests {
 
         let (start_height, count) = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
-                let frame = hostile.recv_ordered_frame(ZAKURA_STREAM_BLOCK_SYNC).await?;
+                let frame = hostile
+                    .recv_ordered_frame_with_version(ZAKURA_STREAM_BLOCK_SYNC, version)
+                    .await?;
                 match BlockSyncMessage::decode_frame(frame)
                     .map_err(|error| -> BoxError { Box::new(error) })?
                 {
@@ -1287,12 +1339,13 @@ mod tests {
              physically read GetBlocks from stream 6"
         );
 
-        if regulated {
+        if regulated_peer {
             // Keep both directions active with bounded application queues.
             // Do not consume the served response until our own bodies reach the driver.
             hostile
-                .send_raw_frame(
+                .send_ordered_raw_frame_with_version(
                     ZAKURA_STREAM_BLOCK_SYNC,
+                    version,
                     BlockSyncMessage::GetBlocks {
                         start_height,
                         count,
@@ -1302,33 +1355,87 @@ mod tests {
                 .await?;
         }
 
+        if mostly_old {
+            // Old requesters can repeat a range before its ending. Both requests
+            // must stay on the v2 serving path even though this node supports v3.
+            for _ in 0..2 {
+                hostile
+                    .send_ordered_raw_frame_with_version(
+                        ZAKURA_STREAM_BLOCK_SYNC,
+                        version,
+                        BlockSyncMessage::GetBlocks {
+                            start_height,
+                            count,
+                        }
+                        .encode_frame()?,
+                    )
+                    .await?;
+            }
+            // Give one body as progress, then withhold the rest until our v2
+            // requester retries the still-live range without a BlocksDone.
+            hostile
+                .send_ordered_raw_frame_with_version(
+                    ZAKURA_STREAM_BLOCK_SYNC,
+                    version,
+                    BlockSyncMessage::Block(blocks[0].clone()).encode_frame()?,
+                )
+                .await?;
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let frame = hostile
+                        .recv_ordered_frame_with_version(ZAKURA_STREAM_BLOCK_SYNC, version)
+                        .await?;
+                    if let BlockSyncMessage::GetBlocks {
+                        start_height: retry,
+                        count: retried,
+                    } = BlockSyncMessage::decode_frame(frame)?
+                    {
+                        assert!(retry > start_height);
+                        assert!(retried > 0 && retry.0 < start_height.0 + count);
+                        return Ok::<_, BoxError>(());
+                    }
+                }
+            })
+            .await
+            .map_err(|_| -> BoxError {
+                "old peer never received the overlapping timeout retry".into()
+            })??;
+        }
+
         let end_height = start_height
             .0
             .checked_add(count)
             .expect("test request height range fits u32");
         for height in start_height.0..end_height {
+            if mostly_old && height == start_height.0 {
+                continue;
+            }
             let block = blocks
                 .iter()
                 .find(|block| block.coinbase_height() == Some(block::Height(height)))
                 .expect("requested test block exists")
                 .clone();
             hostile
-                .send_raw_frame(
+                .send_ordered_raw_frame_with_version(
                     ZAKURA_STREAM_BLOCK_SYNC,
+                    version,
                     BlockSyncMessage::Block(block).encode_frame()?,
                 )
                 .await?;
         }
-        hostile
-            .send_raw_frame(
-                ZAKURA_STREAM_BLOCK_SYNC,
-                BlockSyncMessage::BlocksDone {
-                    start_height,
-                    returned: count,
-                }
-                .encode_frame()?,
-            )
-            .await?;
+        if !mostly_old {
+            hostile
+                .send_ordered_raw_frame_with_version(
+                    ZAKURA_STREAM_BLOCK_SYNC,
+                    version,
+                    BlockSyncMessage::BlocksDone {
+                        start_height,
+                        returned: count,
+                    }
+                    .encode_frame()?,
+                )
+                .await?;
+        }
 
         let expected: Vec<_> = (start_height.0..end_height).map(block::Height).collect();
         await_until(
@@ -1367,11 +1474,13 @@ mod tests {
         )
         .await?;
 
-        if regulated {
+        if regulated_peer {
             let served = tokio::time::timeout(Duration::from_secs(5), async {
                 let mut hashes = Vec::new();
                 loop {
-                    let frame = hostile.recv_ordered_frame(ZAKURA_STREAM_BLOCK_SYNC).await?;
+                    let frame = hostile
+                        .recv_ordered_frame_with_version(ZAKURA_STREAM_BLOCK_SYNC, version)
+                        .await?;
                     match BlockSyncMessage::decode_frame(frame)? {
                         BlockSyncMessage::Status(_) => {}
                         BlockSyncMessage::Block(block) => hashes.push(block.hash()),
@@ -1395,6 +1504,49 @@ mod tests {
             );
         }
 
+        if mostly_old {
+            hostile
+                .reset_ordered_stream(ZAKURA_STREAM_BLOCK_SYNC, version)
+                .await?;
+            await_until(
+                "old block-sync session retired",
+                Duration::from_secs(5),
+                || {
+                    let peers = victim.block_sync().unwrap().peer_snapshot();
+                    peers.inbound_peers + peers.outbound_peers == 0
+                },
+            )
+            .await?;
+            hostile
+                .send_ordered_raw_frame_with_version(
+                    ZAKURA_STREAM_BLOCK_SYNC,
+                    version,
+                    BlockSyncMessage::Status(BlockSyncStatus {
+                        servable_high: block::Height(3),
+                        ..Default::default()
+                    })
+                    .encode_frame()?,
+                )
+                .await?;
+            let status = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let frame = hostile
+                        .recv_ordered_frame_with_version(ZAKURA_STREAM_BLOCK_SYNC, version)
+                        .await?;
+                    if let BlockSyncMessage::Status(status) = BlockSyncMessage::decode_frame(frame)?
+                    {
+                        return Ok::<_, BoxError>(status);
+                    }
+                }
+            })
+            .await
+            .map_err(|_| -> BoxError { "replacement v2 stream did not receive Status".into() })??;
+            assert!(status.max_inflight_requests > 0);
+        }
+
+        for peer in bystanders {
+            peer.shutdown().await;
+        }
         driver.abort();
         hostile.shutdown().await;
         cluster.shutdown().await;

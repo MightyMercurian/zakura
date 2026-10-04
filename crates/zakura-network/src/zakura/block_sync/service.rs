@@ -21,16 +21,24 @@ pub const MAX_BS_FRAME_BYTES: u32 = {
     (MAX_BS_MESSAGE_BYTES + FRAME_HEADER_BYTES) as u32
 };
 
-const BLOCK_SYNC_SERVICE_STREAMS: [Stream; 1] = [Stream {
+const LEGACY_BLOCK_SYNC_STREAMS: [Stream; 1] = [Stream {
     kind: ZAKURA_STREAM_BLOCK_SYNC,
     version: ZAKURA_BLOCK_SYNC_STREAM_VERSION,
     frame_cap: MAX_BS_FRAME_BYTES,
     capability: ZAKURA_CAP_BLOCK_SYNC,
-    messages: Some(super::regulated::wire::RULES),
     ..Stream::PERSISTENT
 }];
+const BLOCK_SYNC_SERVICE_STREAMS: [Stream; 1] = [Stream {
+    version: ZAKURA_REGULATED_BLOCK_SYNC_STREAM_VERSION,
+    capability: ZAKURA_CAP_BLOCK_SYNC_REGULATED,
+    messages: Some(super::regulated::wire::RULES),
+    ..LEGACY_BLOCK_SYNC_STREAMS[0]
+}];
+const SUPPORTED_BLOCK_SYNC_STREAMS: [Stream; 2] =
+    [LEGACY_BLOCK_SYNC_STREAMS[0], BLOCK_SYNC_SERVICE_STREAMS[0]];
 
-/// Service-declared streams for native block sync.
+/// The regulated layout. Version 2 remains a separate compatibility layout.
+#[cfg(test)]
 pub(crate) fn block_sync_streams() -> &'static [Stream] {
     &BLOCK_SYNC_SERVICE_STREAMS
 }
@@ -533,7 +541,16 @@ impl Service for BlockSyncService {
     }
 
     fn streams(&self) -> &[Stream] {
-        block_sync_streams()
+        if self
+            .inner
+            .routine_wiring
+            .as_ref()
+            .is_some_and(|wiring| wiring.serving.is_some())
+        {
+            &SUPPORTED_BLOCK_SYNC_STREAMS
+        } else {
+            &LEGACY_BLOCK_SYNC_STREAMS
+        }
     }
 
     fn reserve_session(
@@ -647,15 +664,38 @@ impl Service for BlockSyncService {
             return;
         }
 
-        let Some((recv, send)) = peer.take_stream(ZAKURA_STREAM_BLOCK_SYNC) else {
+        let Some((_, version, recv, send)) =
+            peer.take_versioned_stream_with_session_id(ZAKURA_STREAM_BLOCK_SYNC)
+        else {
             return;
         };
+        // Public in-process Peer constructors predate stream version metadata.
+        let version = if version == 0 {
+            ZAKURA_BLOCK_SYNC_STREAM_VERSION
+        } else {
+            version
+        };
+        let regulated = version == ZAKURA_REGULATED_BLOCK_SYNC_STREAM_VERSION;
+        if (version != ZAKURA_BLOCK_SYNC_STREAM_VERSION && !regulated)
+            || (regulated
+                && (peer.negotiated & ZAKURA_CAP_BLOCK_SYNC_REGULATED == 0
+                    || send.max_capacity() < 2
+                    || !self
+                        .inner
+                        .routine_wiring
+                        .as_ref()
+                        .is_some_and(|wiring| wiring.serving.is_some())))
+        {
+            peer.close_cause().record("block_sync_regulation_contract");
+            peer.cancel_token().cancel();
+            return;
+        }
 
         let peer_id = peer.id.clone();
         let session = PeerStreamSession::new(
             peer_id.clone(),
             ZAKURA_STREAM_BLOCK_SYNC,
-            ZAKURA_BLOCK_SYNC_STREAM_VERSION,
+            version,
             recv,
             send,
             peer.service_cancel_token(),
@@ -681,7 +721,7 @@ impl Service for BlockSyncService {
             .inner
             .routine_wiring
             .as_ref()
-            .filter(|wiring| wiring.serving.is_some())
+            .filter(|wiring| regulated && wiring.serving.is_some())
             .map(|_| {
                 crate::zakura::regulation::WriterFence::new(
                     connection_cancel_token.clone(),
@@ -846,13 +886,18 @@ impl Service for BlockSyncService {
                         let generation = routine_generation.expect(
                             "production block-sync wiring allocates a routine generation before spawn",
                         );
-                        let serving = wiring.serving.as_ref().map(|serving| {
-                            serving.session(
-                                &peer_id,
-                                block_sync_session.request_sender(),
-                                run_cancel.clone(),
-                            )
-                        });
+                        let serving =
+                            wiring
+                                .serving
+                                .as_ref()
+                                .filter(|_| regulated)
+                                .map(|serving| {
+                                    serving.session(
+                                        &peer_id,
+                                        block_sync_session.request_sender(),
+                                        run_cancel.clone(),
+                                    )
+                                });
                         let requester = requester_fence.map(|fence| {
                             super::regulated::live_requester::LiveRequester::new(
                                 wiring.request_pool.clone(),
@@ -1130,14 +1175,24 @@ mod regulated_frame_tests {
         let mut attach = |conn_id| {
             let (in_tx, in_rx) = crate::zakura::framed_channel(4);
             let (out_tx, out_rx) = crate::zakura::framed_channel(4);
-            service.add_peer(Peer::new_with_conn_id_and_direction(
+            service.add_peer(Peer::new_with_service_streams(
                 conn_id,
                 peer.clone(),
                 None,
-                ZAKURA_CAP_BLOCK_SYNC,
+                ZAKURA_CAP_BLOCK_SYNC_REGULATED,
                 ServicePeerDirection::Outbound,
-                HashMap::from([(ZAKURA_STREAM_BLOCK_SYNC, (in_rx, out_tx))]),
+                HashMap::from([(
+                    ZAKURA_STREAM_BLOCK_SYNC,
+                    crate::zakura::transport::ServiceStream::new(
+                        0,
+                        ZAKURA_REGULATED_BLOCK_SYNC_STREAM_VERSION,
+                        in_rx,
+                        out_tx,
+                        CancellationToken::new(),
+                    ),
+                )]),
                 CancellationToken::new(),
+                crate::zakura::CloseCause::default(),
             ));
             held_channels.push((in_tx, out_rx));
             service
@@ -1182,6 +1237,87 @@ mod regulated_frame_tests {
         transport::{FrameFilter, InboundReader},
         MessageRole,
     };
+
+    #[tokio::test]
+    async fn negotiation_selects_the_whole_contract_and_requires_a_range_source() {
+        let service = Arc::new(BlockSyncService::new_with_startup(
+            BlockSyncStartup::inert(ZakuraBlockSyncConfig::default())
+                .with_range_source(Arc::new(EmptySource)),
+        ));
+        let registry = crate::zakura::ServiceRegistry::new(vec![service]).unwrap();
+        for (caps, version, table) in [
+            (
+                ZAKURA_CAP_BLOCK_SYNC,
+                ZAKURA_BLOCK_SYNC_STREAM_VERSION,
+                false,
+            ),
+            (
+                ZAKURA_CAP_BLOCK_SYNC_REGULATED,
+                ZAKURA_REGULATED_BLOCK_SYNC_STREAM_VERSION,
+                true,
+            ),
+            (
+                ZAKURA_CAP_BLOCK_SYNC | ZAKURA_CAP_BLOCK_SYNC_REGULATED,
+                ZAKURA_REGULATED_BLOCK_SYNC_STREAM_VERSION,
+                true,
+            ),
+        ] {
+            let streams = registry.persistent_streams_for_negotiated(caps);
+            assert_eq!(streams.len(), 1);
+            assert_eq!(streams[0].version, version);
+            assert_eq!(streams[0].messages.is_some(), table);
+        }
+        let unbounded = BlockSyncService::new(ZakuraBlockSyncConfig::default());
+        assert_eq!(unbounded.streams(), &LEGACY_BLOCK_SYNC_STREAMS);
+    }
+
+    #[tokio::test]
+    async fn only_regulated_sessions_install_fences_and_reject_one_slot() {
+        for (version, depth) in [(2, 1), (2, 2), (3, 1), (3, 2)] {
+            let service = BlockSyncService::new_with_startup(
+                BlockSyncStartup::inert(ZakuraBlockSyncConfig::default())
+                    .with_range_source(Arc::new(EmptySource)),
+            );
+            let peer = ZakuraPeerId::new(vec![45; 32]).unwrap();
+            let connection = CancellationToken::new();
+            let (_input, recv) = crate::zakura::framed_channel(depth);
+            let (send, _output) = crate::zakura::framed_channel(depth);
+            service.add_peer(Peer::new_with_service_streams(
+                1,
+                peer.clone(),
+                None,
+                ZAKURA_CAP_BLOCK_SYNC | ZAKURA_CAP_BLOCK_SYNC_REGULATED,
+                ServicePeerDirection::Outbound,
+                HashMap::from([(
+                    ZAKURA_STREAM_BLOCK_SYNC,
+                    crate::zakura::transport::ServiceStream::new(
+                        1,
+                        version,
+                        recv,
+                        send,
+                        connection.child_token(),
+                    ),
+                )]),
+                connection.clone(),
+                crate::zakura::CloseCause::default(),
+            ));
+            assert_eq!(connection.is_cancelled(), version == 3 && depth == 1);
+            assert_eq!(
+                service.inner.requester_sessions.get(&peer).is_some(),
+                version == 3 && depth >= 2
+            );
+            assert_eq!(
+                service
+                    .inner
+                    .status_senders
+                    .lock()
+                    .unwrap()
+                    .contains_key(&(peer, 1)),
+                version == 3 && depth >= 2
+            );
+            connection.cancel();
+        }
+    }
 
     #[test]
     fn production_getblocks_layout_declares_exact_control_and_body_limits() {

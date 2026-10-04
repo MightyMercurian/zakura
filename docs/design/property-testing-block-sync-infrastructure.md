@@ -1,6 +1,6 @@
 # GetBlocks regulation tests
 
-> **Status: first draft.** This plan covers block-sync version 2 under the
+> **Status: first draft.** This plan covers regulated block-sync version 3 and version 2 compatibility under the
 > [testing design](property-testing.md). The
 > [specification](../specs/peer-message-regulation.md) defines behavior.
 
@@ -12,7 +12,8 @@ control capacity, storage completion, and response delivery.
 
 This work introduces no Work bucket, refund, mandatory Delay verdict, or serving query-result timer.
 It does not require a generic framework or exhaustive explorer. Header subscriptions have separate
-tests. Version 2 retains height-range correlation and forbids overlapping live ranges per connection.
+tests. Version 3 retains height-range correlation and forbids overlapping live ranges per connection.
+Version 2 keeps the legacy behavior for peers that have not negotiated regulation.
 
 ## Existing infrastructure
 
@@ -132,5 +133,10 @@ serving and exhausted credit. It uses the shared serving harness, so the product
 peer-routine QUIC test remains a separate check. Existing synthetic tests without a range source
 still exercise the old serving path and do not establish regulated-path coverage.
 
-Activation also remains gated on mixed-version retry behavior and the version-2 hash-mismatch
-policy. Neither policy is changed by the decoder or shared serving prerequisites.
+Version 3 selects the entire regulated contract through its own capability. A real-QUIC test uses
+five old peers and one upgraded peer, downloads from an old peer without endings, forces an
+overlapping timeout retry, accepts overlapping old requests, and checks Status after replacement.
+Unexpected header hashes retire locally and retain authorization until cleanup. A short supplier
+cooldown survives reconnect without replacing the sequencer's retry episode. Buffered endings
+survive local read pauses, while actively withheld endings still retire the connection.
+The decoder and shared serving prerequisites do not activate these policies.

@@ -366,18 +366,26 @@ async fn regulated_retention_coalesces_corrections_at_the_status_deadline() {
         .unwrap();
     resources.admitted();
     let (inbound, receiver) = framed_channel(16);
-    let (sender, mut outbound) = framed_channel(1);
+    let (sender, mut outbound) = framed_channel(2);
     let connected_at = time::Instant::now();
-    harness.service.add_peer(Peer::new_with_direction(
+    harness.service.add_peer(Peer::new_with_service_streams(
+        0,
         peer(0xeb),
         None,
-        ZAKURA_CAP_BLOCK_SYNC,
+        ZAKURA_CAP_BLOCK_SYNC_REGULATED,
         ServicePeerDirection::Outbound,
         HashMap::from([(
             ZAKURA_STREAM_BLOCK_SYNC,
-            (receiver, sender.with_session_resources(Some(resources))),
+            crate::zakura::transport::ServiceStream::new(
+                0,
+                ZAKURA_REGULATED_BLOCK_SYNC_STREAM_VERSION,
+                receiver,
+                sender.with_session_resources(Some(resources)),
+                CancellationToken::new(),
+            ),
         )]),
         CancellationToken::new(),
+        crate::zakura::CloseCause::default(),
     ));
     let initial = wait_for_outbound_status(&mut outbound).await;
     assert_eq!(initial.servable_low, block::Height(1));
