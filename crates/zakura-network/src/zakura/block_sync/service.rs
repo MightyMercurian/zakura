@@ -79,6 +79,14 @@ impl BlockSyncPeerSession {
         &self.peer_id
     }
 
+    #[cfg(test)]
+    pub(super) fn with_status_for_test(mut self, status: BlockSyncStatus) -> Self {
+        let state = Arc::new(super::regulated::status_sender::StatusSender::default());
+        state.record_received(status);
+        self.status_sender = Some(state);
+        self
+    }
+
     /// Direction of the underlying Zakura connection.
     pub fn direction(&self) -> ServicePeerDirection {
         self.direction

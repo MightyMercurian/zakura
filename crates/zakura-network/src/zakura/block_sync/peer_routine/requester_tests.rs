@@ -43,6 +43,47 @@ fn requester_routine_with_pool(
 }
 
 #[tokio::test]
+async fn replacement_requests_from_cached_status_without_waiting_for_an_announcement() {
+    let (mut routine, mut outbound, _events) = super::tests::status_test_routine();
+    routine.session = routine
+        .session
+        .clone()
+        .with_status_for_test(BlockSyncStatus {
+            servable_high: block::Height(10),
+            ..Default::default()
+        });
+    let (_input, recv) = crate::zakura::framed_channel(4);
+    routine.recv = recv;
+    let (_view, view_rx) = watch::channel(*routine.sequencer_view.borrow());
+    routine.sequencer_view = view_rx;
+    routine.work.extend(
+        super::super::test_work_scope(),
+        [(
+            block::Height(1),
+            block::Hash([1; 32]),
+            BlockSizeEstimate::Confirmed(1000),
+        )],
+    );
+    assert!(!routine.received_status);
+    let mut running = Box::pin(routine.run());
+    let request = tokio::time::timeout(Duration::from_secs(1), async {
+        tokio::select! {
+            request = outbound.recv() => request.unwrap(),
+            result = &mut running => panic!("routine ended before requesting: {result:?}"),
+        }
+    })
+    .await
+    .unwrap();
+    assert!(matches!(
+        BlockSyncMessage::decode_frame(request).unwrap(),
+        BlockSyncMessage::GetBlocks {
+            start_height: block::Height(1),
+            ..
+        }
+    ));
+}
+
+#[tokio::test]
 async fn written_timeout_preserves_authorization_and_blocks_overlap_until_ending() {
     let (mut routine, mut outbound, pool, connection) = requester_routine(block::Hash([1; 32]));
     routine.try_fill().await;
