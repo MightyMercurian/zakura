@@ -569,6 +569,18 @@ impl Service for BlockSyncService {
         }
     }
 
+    fn reserve_session_for_stream(
+        &self,
+        stream: Stream,
+        direction: ServicePeerDirection,
+    ) -> Result<Option<Arc<dyn crate::zakura::SessionResources>>, crate::zakura::SessionFull> {
+        if stream.version == ZAKURA_REGULATED_BLOCK_SYNC_STREAM_VERSION {
+            self.reserve_session(direction)
+        } else {
+            Ok(None)
+        }
+    }
+
     fn session_policy(&self) -> SessionPolicy {
         SessionPolicy {
             opening: SessionOpening::EitherSide,
@@ -580,18 +592,19 @@ impl Service for BlockSyncService {
         &self,
         conn_id: ZakuraConnId,
         peer: &ZakuraPeerId,
-        _negotiated: u64,
+        negotiated: u64,
         direction: ServicePeerDirection,
     ) -> SessionDemand {
         if let Some(deadline) = self.peer_park_deadline(peer) {
             return SessionDemand::RetryAt(deadline);
         }
 
-        if self
-            .inner
-            .routine_wiring
-            .as_ref()
-            .is_some_and(|wiring| wiring.serving.is_some())
+        if negotiated & ZAKURA_CAP_BLOCK_SYNC_REGULATED != 0
+            && self
+                .inner
+                .routine_wiring
+                .as_ref()
+                .is_some_and(|wiring| wiring.serving.is_some())
         {
             let demand = self.inner.sessions.demand(direction);
             if !matches!(demand, SessionDemand::OpenNow) {
@@ -1324,6 +1337,81 @@ mod regulated_frame_tests {
             );
             connection.cancel();
         }
+    }
+
+    #[tokio::test]
+    async fn legacy_session_replacement_at_the_direction_cap_needs_no_second_slot() {
+        let mut config = ZakuraBlockSyncConfig::default();
+        config.peer_limits.max_outbound_peers = 1;
+        let service = BlockSyncService::new_with_startup(
+            BlockSyncStartup::inert(config).with_range_source(Arc::new(EmptySource)),
+        );
+        let peer = ZakuraPeerId::new(vec![46; 32]).unwrap();
+        let connection = CancellationToken::new();
+        let mut channels = Vec::new();
+        let mut sessions = Vec::new();
+        for session_id in 0..2 {
+            assert!(service
+                .reserve_session_for_stream(
+                    LEGACY_BLOCK_SYNC_STREAMS[0],
+                    ServicePeerDirection::Outbound
+                )
+                .unwrap()
+                .is_none());
+            let (input, recv) = crate::zakura::framed_channel(2);
+            let (send, output) = crate::zakura::framed_channel(2);
+            let cancel = connection.child_token();
+            service.add_peer(Peer::new_with_service_streams(
+                1,
+                peer.clone(),
+                None,
+                ZAKURA_CAP_BLOCK_SYNC,
+                ServicePeerDirection::Outbound,
+                HashMap::from([(
+                    ZAKURA_STREAM_BLOCK_SYNC,
+                    crate::zakura::transport::ServiceStream::new(
+                        session_id,
+                        ZAKURA_BLOCK_SYNC_STREAM_VERSION,
+                        recv,
+                        send,
+                        cancel.clone(),
+                    ),
+                )]),
+                connection.clone(),
+                crate::zakura::CloseCause::default(),
+            ));
+            assert!(!cancel.is_cancelled());
+            assert!(!service.peer_slots_free(ServicePeerDirection::Outbound));
+            channels.push((input, output));
+            sessions.push(cancel);
+        }
+        assert!(sessions[0].is_cancelled());
+        assert!(!sessions[1].is_cancelled());
+        assert!(!connection.is_cancelled());
+
+        // Strict teardown accounting applies only to the regulated layout.
+        let held = service
+            .reserve_session_for_stream(
+                BLOCK_SYNC_SERVICE_STREAMS[0],
+                ServicePeerDirection::Outbound,
+            )
+            .unwrap()
+            .unwrap();
+        held.admitted();
+        assert!(service
+            .reserve_session_for_stream(
+                BLOCK_SYNC_SERVICE_STREAMS[0],
+                ServicePeerDirection::Outbound,
+            )
+            .is_err());
+        assert!(service
+            .reserve_session_for_stream(
+                LEGACY_BLOCK_SYNC_STREAMS[0],
+                ServicePeerDirection::Outbound,
+            )
+            .unwrap()
+            .is_none());
+        connection.cancel();
     }
 
     #[test]

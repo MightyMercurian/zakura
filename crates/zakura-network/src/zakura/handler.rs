@@ -3039,7 +3039,7 @@ impl ZakuraProtocolHandler {
             .registry
             .service_for_kind(stream.kind)
             .expect("a selected stream has an owning service")
-            .reserve_session(direction)
+            .reserve_session_for_stream(stream, direction)
             .map_err(|_| ZakuraHandlerError::SessionFull)?;
         let wire_id = layout.is_multi_stream().then(random_stream_session_seed);
         let mut prepared = Vec::with_capacity(layout.streams.len());
