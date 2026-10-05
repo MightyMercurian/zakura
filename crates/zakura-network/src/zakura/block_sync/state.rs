@@ -1100,7 +1100,7 @@ pub(super) struct RateMeter {
 impl RateMeter {
     pub(super) fn new(interval: Duration) -> Self {
         Self {
-            next_allowed: Instant::now(),
+            next_allowed: tokio::time::Instant::now().into_std(),
             interval,
         }
     }

@@ -456,7 +456,7 @@ impl PeerRoutine {
                 while let Ok(frame) = self.recv.try_recv() {
                     self.handle_frame(&mut guard, frame).await?;
                 }
-                return self.handle_stream_failure(Instant::now(), failure);
+                return self.handle_stream_failure(time::Instant::now().into_std(), failure);
             }
         }
         result
@@ -503,7 +503,7 @@ impl PeerRoutine {
 
             // Check before the biased receive arm so incoming traffic cannot
             // keep abandoned authorization alive indefinitely.
-            self.check_request_liveness(Instant::now())?;
+            self.check_request_liveness(time::Instant::now().into_std())?;
             self.flush_pending_status();
             let retry_filter_deadline = if self.session.outbound_capacity() > 0 {
                 self.try_fill().await
@@ -519,7 +519,7 @@ impl PeerRoutine {
             if outbound_queue_has_capacity {
                 self.outbound_full_since = None;
             } else if self.outbound_full_since.is_none() {
-                self.outbound_full_since = Some(Instant::now());
+                self.outbound_full_since = Some(time::Instant::now().into_std());
             }
 
             // Sleep until the earliest outstanding deadline (own-timeout arm).
@@ -543,7 +543,7 @@ impl PeerRoutine {
                         // no-progress stall (park or disconnect). `Drop` returns
                         // unreceived outstanding heights and releases their budget.
                         None => return self.handle_stream_failure(
-                            Instant::now(),
+                            time::Instant::now().into_std(),
                             self.recv.failure().unwrap_or(OrderedStreamFailure::RemoteClose),
                         ),
                     }
@@ -555,7 +555,7 @@ impl PeerRoutine {
                         Err(_) => return Ok(()),
                     }
                 }
-                _ = &mut timeout => self.handle_deadlines(Instant::now()).await?,
+                _ = &mut timeout => self.handle_deadlines(time::Instant::now().into_std()).await?,
                 _ = &mut capacity => {
                     self.trace_wake("budget_capacity");
                 }
@@ -603,37 +603,38 @@ impl PeerRoutine {
             }
         }
 
-        let authorized_height =
-            if let Some(requester) = &self.requester {
-                use super::regulated::live_requester::Authorization;
-                match requester.authorize(&frame)? {
-                    Authorization::Block(height) => Some(height),
-                    Authorization::Control => None,
-                    Authorization::IncompatibleHeader => {
-                        // Height-only requests cannot identify which live range the
-                        // unexpected header belongs to. Defer each still-wanted
-                        // body for this supplier without delaying other suppliers.
-                        let bodies = requester.unreceived_expected().into_iter().filter_map(
-                            |(height, hash)| {
+        let authorized_height = if let Some(requester) = &self.requester {
+            use super::regulated::live_requester::Authorization;
+            match requester.authorize(&frame)? {
+                Authorization::Block(height) => Some(height),
+                Authorization::Control => None,
+                Authorization::IncompatibleHeader => {
+                    // Height-only requests cannot identify which live range the
+                    // unexpected header belongs to. Defer each still-wanted
+                    // body for this supplier without delaying other suppliers.
+                    let bodies =
+                        requester
+                            .unreceived_expected()
+                            .into_iter()
+                            .filter_map(|(height, hash)| {
                                 self.work
                                     .item_for_height(height)
                                     .filter(|item| item.hash == hash)
                                     .map(|item| (item.scope, hash))
-                            },
-                        );
-                        self.registry.defer_incompatible_bodies(
-                            self.source,
-                            bodies,
-                            Instant::now() + self.config.effective_liveness_timeout(),
-                        );
-                        return Err(SinkReject::local(
-                            "GetBlocks header does not match the next expected header",
-                        ));
-                    }
+                            });
+                    self.registry.defer_incompatible_bodies(
+                        self.source,
+                        bodies,
+                        time::Instant::now().into_std() + self.config.effective_liveness_timeout(),
+                    );
+                    return Err(SinkReject::local(
+                        "GetBlocks header does not match the next expected header",
+                    ));
                 }
-            } else {
-                None
-            };
+            }
+        } else {
+            None
+        };
         let frame_payload_bytes = frame.payload.len();
         let body_permit = if is_block_frame(&frame) {
             let permit = self.reserve_body_decode_permit();
@@ -758,7 +759,7 @@ impl PeerRoutine {
             .as_ref()
             .map(|requester| requester.pause_reading());
         let capacity_before = self.sequencer_input.capacity();
-        let started = Instant::now();
+        let started = time::Instant::now().into_std();
         let permit = self
             .sequencer_input
             .clone()
@@ -784,7 +785,7 @@ impl PeerRoutine {
             return;
         }
         self.session.record_received_status(status);
-        let now = Instant::now();
+        let now = time::Instant::now().into_std();
         let range_changed =
             status.servable_high != self.servable_high || status.servable_low != self.servable_low;
         if self.inbound_status_meter.try_take(now) {
@@ -830,7 +831,10 @@ impl PeerRoutine {
     }
 
     fn flush_pending_status(&mut self) {
-        if !self.inbound_status_meter.is_ready(Instant::now()) {
+        if !self
+            .inbound_status_meter
+            .is_ready(time::Instant::now().into_std())
+        {
             return;
         }
         if let Some(status) = self.pending_status.take() {
@@ -886,7 +890,7 @@ impl PeerRoutine {
     /// its only work re-runs want-work once the bias lifts even if no external event
     /// arrives. Defaults to a long idle sleep when none exists.
     fn earliest_deadline_sleep(&self, retry_filter_deadline: Option<Instant>) -> time::Sleep {
-        let now = Instant::now();
+        let now = time::Instant::now().into_std();
         let earliest_deadline = self
             .window
             .outstanding
@@ -946,7 +950,7 @@ impl PeerRoutine {
         self.gc_committed_outstanding();
         // Drop expired retry-avoid entries: those heights are contestable by this
         // routine again.
-        let now = Instant::now();
+        let now = time::Instant::now().into_std();
         self.retry_avoid.retain(|_, until| *until > now);
         let mut retry_filter_deadline = None;
         // Count requests issued this pass and capture *why* the fill loop stops, so a
@@ -1295,7 +1299,7 @@ impl PeerRoutine {
             } else {
                 None
             };
-            let queued_at = Instant::now();
+            let queued_at = time::Instant::now().into_std();
             let msg = BlockSyncMessage::GetBlocks {
                 start_height: request.start_height,
                 count: request.count,
@@ -1511,7 +1515,7 @@ impl PeerRoutine {
     /// immediately re-grab them (the peer-local retry bias). The heights stay
     /// `pending` and contestable by every other peer; only this routine defers.
     fn note_retry_avoid(&mut self, heights: impl IntoIterator<Item = block::Height>) {
-        let until = Instant::now() + RETRY_AVOID_BACKOFF;
+        let until = time::Instant::now().into_std() + RETRY_AVOID_BACKOFF;
         for height in heights {
             self.retry_avoid.insert(height, until);
         }
@@ -1921,8 +1925,10 @@ impl PeerRoutine {
             Some(request_elapsed_ms),
         );
 
-        self.window
-            .note_block_progress(Instant::now(), self.config.effective_liveness_timeout());
+        self.window.note_block_progress(
+            time::Instant::now().into_std(),
+            self.config.effective_liveness_timeout(),
+        );
         let mut completed = None;
         if let Some(outstanding) = self.window.outstanding.get_mut(index) {
             outstanding.record_body_bytes(serialized_bytes);
@@ -1936,7 +1942,7 @@ impl PeerRoutine {
             // and the per-ack delivery rate (BtlBw) for this request's block count and
             // delivered bytes.
             self.window.record_delivery(
-                Instant::now(),
+                time::Instant::now().into_std(),
                 request_elapsed,
                 request_range_count,
                 outstanding.delivered_bytes,
@@ -2003,8 +2009,8 @@ impl PeerRoutine {
         serialized_bytes: u64,
         body_permit: Option<mpsc::OwnedPermit<SequencedBody>>,
     ) {
-        let received_at = Instant::now();
-        let sequencer_send_started = Instant::now();
+        let received_at = time::Instant::now().into_std();
+        let sequencer_send_started = time::Instant::now().into_std();
         let body = SequencedBody::new_queued(
             owner,
             self.source,
@@ -2142,8 +2148,10 @@ impl PeerRoutine {
         // parked as "silent". Deliberately do NOT feed the BBR RTprop/BtlBw estimators —
         // the originating request is gone, so there's no trustworthy send timestamp and a
         // stale late-delivery interval would corrupt the rate/latency samples.
-        self.window
-            .note_block_progress(Instant::now(), self.config.effective_liveness_timeout());
+        self.window.note_block_progress(
+            time::Instant::now().into_std(),
+            self.config.effective_liveness_timeout(),
+        );
         // Also credit the reliability EWMA: this late body offsets the failure its own
         // timeout charged, so a peer that merely slowed down (backlog draining past the
         // per-request deadline but every body still arriving) keeps a reduced-but-nonzero
@@ -2428,8 +2436,10 @@ impl PeerRoutine {
     /// the budget again. Count it as block progress since a real wanted body did
     /// arrive on this peer's stream.
     fn accept_already_settled_height(&mut self, index: usize, height: block::Height) {
-        self.window
-            .note_block_progress(Instant::now(), self.config.effective_liveness_timeout());
+        self.window.note_block_progress(
+            time::Instant::now().into_std(),
+            self.config.effective_liveness_timeout(),
+        );
         let completed = self
             .window
             .outstanding
@@ -2502,7 +2512,7 @@ impl PeerRoutine {
                 // Filter the published RTprop by now so a peer that stopped completing
                 // requests stops advertising a stale-low RTprop to the cross-peer
                 // floor-preference comparison.
-                bbr_rtprop_ms: self.window.bbr_rtprop_ms(Instant::now()),
+                bbr_rtprop_ms: self.window.bbr_rtprop_ms(time::Instant::now().into_std()),
             },
         );
     }

@@ -657,7 +657,7 @@ async fn buffered_ending_survives_a_long_local_decode_wait() {
     assert!(!connection.is_cancelled());
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_live_partially_returned_range_waits_without_retry_spin() {
     let (mut routine, mut outbound, _, connection) = requester_routine(block::Hash([1; 32]));
     routine.config.max_blocks_per_response = 2;
@@ -700,6 +700,9 @@ async fn a_live_partially_returned_range_waits_without_retry_spin() {
     let mut running = Box::pin(routine.run_inner(&mut guard));
     for _ in 0..100 {
         assert!(futures::poll!(&mut running).is_pending());
+        // Let zero-duration sleeps actually fire. Pure synchronous polling cannot
+        // distinguish a timer-driven spin from a legitimately parked future.
+        time::advance(Duration::from_millis(1)).await;
     }
     drop(running);
     assert!(routine.next_request_id.unwrap().get() - before <= 2);
@@ -715,56 +718,68 @@ async fn a_disappeared_avoidance_timer_still_retries_immediately() {
     assert_eq!(routine.retry_filter_wake_deadline(now, false), None);
 }
 
+/// Active time before a local pause is preserved by the real routine's deadline loop.
 #[tokio::test(start_paused = true)]
 async fn a_withheld_ending_retires_after_reading_resumes_from_a_local_pause() {
-    // Advance first so the test detects a mix of wall and paused Tokio clocks.
     time::advance(Duration::from_secs(7)).await;
-    let block: block::Block = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
+    let first: block::Block = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
         .zcash_deserialize_into()
         .unwrap();
-    let (mut routine, mut outbound, pool, connection) = requester_routine(block.hash());
+    let second: block::Block = zakura_test::vectors::BLOCK_MAINNET_2_BYTES
+        .zcash_deserialize_into()
+        .unwrap();
+    let (mut routine, mut outbound, pool, connection) = requester_routine(first.hash());
+    routine.work.extend(
+        super::super::test_work_scope(),
+        [(
+            block::Height(2),
+            second.hash(),
+            BlockSizeEstimate::Confirmed(2000),
+        )],
+    );
     let (bodies, mut received) = mpsc::channel(1);
-    let held = bodies.clone().try_reserve_owned().unwrap();
     routine.sequencer_input = bodies;
-    routine.try_fill().await;
+    let (input, recv) = crate::zakura::framed_channel(4);
+    routine.recv = recv;
+    let (_view, view_rx) = watch::channel(*routine.sequencer_view.borrow());
+    routine.sequencer_view = view_rx;
+    let mut running = Box::pin(routine.run());
+    assert!(futures::poll!(&mut running).is_pending());
     outbound.recv().await.unwrap();
-    let mut guard = block_sync_guard();
-    let mut processing = Box::pin(
-        routine.handle_frame(
-            &mut guard,
-            BlockSyncMessage::Block(Arc::new(block))
+    input
+        .send(
+            BlockSyncMessage::Block(Arc::new(first))
                 .encode_frame()
                 .unwrap(),
-        ),
-    );
-    assert!(futures::poll!(&mut processing).is_pending());
+        )
+        .await
+        .unwrap();
+    assert!(futures::poll!(&mut running).is_pending());
+    // The first range has its body, but no ending. Its clock runs for ten seconds.
+    assert_eq!(received.len(), 1);
+    outbound.recv().await.unwrap();
+    time::advance(Duration::from_secs(10)).await;
+    input
+        .send(
+            BlockSyncMessage::Block(Arc::new(second))
+                .encode_frame()
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(futures::poll!(&mut running).is_pending());
+    // The second body's local decode slot is blocked behind the first body.
     time::advance(Duration::from_secs(40)).await;
-    drop(held);
-    processing.await.unwrap();
+    assert!(futures::poll!(&mut running).is_pending());
     received.try_recv().unwrap();
-    let resumed = time::Instant::now().into_std();
-    let grace = routine.config.effective_liveness_timeout();
-    assert_eq!(
-        routine
-            .requester
-            .as_ref()
-            .unwrap()
-            .retirement_deadline(grace),
-        Some(resumed + grace)
-    );
-    assert!(routine.check_request_liveness(resumed).is_ok());
+    assert!(futures::poll!(&mut running).is_pending());
+    received.try_recv().unwrap();
     assert!(!connection.is_cancelled());
-    time::advance(grace - Duration::from_nanos(1)).await;
-    assert!(routine
-        .check_request_liveness(time::Instant::now().into_std())
-        .is_ok());
-    time::advance(Duration::from_nanos(1)).await;
-    assert!(matches!(
-        routine.check_request_liveness(time::Instant::now().into_std()),
-        Err(SinkReject::Local(_))
-    ));
+    time::advance(Duration::from_secs(21)).await;
+    assert!(futures::poll!(&mut running).is_pending());
+    assert!(!connection.is_cancelled());
+    time::advance(Duration::from_secs(1)).await;
+    assert!(matches!(running.await, Err(SinkReject::Local(_))));
     assert!(connection.is_cancelled());
-    assert_eq!(pool.held(), 1);
-    drop(routine);
     assert_eq!(pool.held(), 0);
 }

@@ -78,6 +78,7 @@ impl Drop for ReadPause {
 }
 
 impl LiveRequester {
+    /// Exclude one local read wait from ending deadlines. Guards must not overlap.
     pub(crate) fn pause_reading(&self) -> ReadPause {
         ReadPause {
             shared: self.shared.clone(),
@@ -105,6 +106,7 @@ impl LiveRequester {
         }
     }
 
+    /// Snapshot every unclaimed body in all live exchanges, including later positions.
     pub(crate) fn unreceived_expected(&self) -> Vec<(block::Height, block::Hash)> {
         self.shared.lock().unreceived_expected()
     }
