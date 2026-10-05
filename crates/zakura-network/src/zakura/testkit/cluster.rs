@@ -1110,7 +1110,7 @@ mod tests {
         native_getblocks_exchange(false, false, false).await
     }
 
-    /// Reverse the stream-opening tiebreak while retaining one regulated session slot.
+    /// A remotely opened regulated session can consume the last available slot.
     #[tokio::test]
     async fn regulated_getblocks_admits_the_first_remote_session_at_a_limit_of_one(
     ) -> Result<(), BoxError> {
@@ -1172,7 +1172,7 @@ mod tests {
     async fn native_getblocks_exchange(
         regulated: bool,
         mostly_old: bool,
-        reverse: bool,
+        one_session_slot: bool,
     ) -> Result<(), BoxError> {
         use crate::zakura::{
             ZAKURA_CAP_BLOCK_SYNC_REGULATED, ZAKURA_REGULATED_BLOCK_SYNC_STREAM_VERSION,
@@ -1220,8 +1220,16 @@ mod tests {
                 Duration::from_secs(300)
             },
             peer_limits: ServicePeerLimits {
-                max_inbound_peers: if regulated_peer { 1 } else { 256 },
-                max_outbound_peers: if regulated_peer { 1 } else { 256 },
+                max_inbound_peers: if one_session_slot {
+                    1
+                } else {
+                    ServicePeerLimits::default().max_inbound_peers
+                },
+                max_outbound_peers: if one_session_slot {
+                    1
+                } else {
+                    ServicePeerLimits::default().max_outbound_peers
+                },
                 inbound_queue_depth: 1,
                 outbound_queue_depth: 1,
                 ..ServicePeerLimits::default()
@@ -1231,7 +1239,7 @@ mod tests {
 
         let anchor = (block::Height(0), mainnet_genesis_hash());
         let mut cluster = ZakuraTestCluster::new();
-        let builder = ZakuraTestNode::builder(if reverse { 61 } else { 60 })
+        let builder = ZakuraTestNode::builder(60)
             .limits(limits)
             .tracer(capture.tracer_for_node(60))
             .header_sync_driver(
@@ -1275,13 +1283,7 @@ mod tests {
                 .stream_receive_window(iroh::endpoint::VarInt::from_u32(1024))
                 .receive_window(iroh::endpoint::VarInt::from_u32(2048))
                 .build();
-            HostilePeer::connect_native_with_transport(
-                victim,
-                if reverse { 60 } else { 61 },
-                capabilities,
-                transport,
-            )
-            .await?
+            HostilePeer::connect_native_with_transport(victim, 61, capabilities, transport).await?
         } else {
             HostilePeer::connect_native_with_capabilities(victim, 61, capabilities).await?
         };
