@@ -170,7 +170,25 @@ async fn unwritten_timeout_retracts_authorization_without_closing_connection() {
 #[tokio::test]
 async fn wrong_header_is_rejected_before_transaction_decoding_or_decode_capacity() {
     let (mut routine, mut outbound, pool, connection) = requester_routine(block::Hash([1; 32]));
+    routine.config.max_blocks_per_response = 3;
+    routine.max_blocks_per_response = 3;
+    routine.work.extend(
+        super::super::test_work_scope(),
+        [
+            (
+                block::Height(2),
+                block::Hash([2; 32]),
+                BlockSizeEstimate::Confirmed(1000),
+            ),
+            (
+                block::Height(3),
+                block::Hash([3; 32]),
+                BlockSizeEstimate::Confirmed(1000),
+            ),
+        ],
+    );
     routine.try_fill().await;
+    assert_eq!(routine.window.outstanding[0].request.count, 3);
     tokio::time::timeout(Duration::from_secs(1), outbound.recv())
         .await
         .unwrap()
@@ -213,8 +231,24 @@ async fn wrong_header_is_rejected_before_transaction_decoding_or_decode_capacity
         block::Hash([1; 32]),
         Instant::now()
     ));
+    for byte in [2, 3] {
+        assert!(work.pending_contains(block::Height(u32::from(byte))));
+        assert!(registry.is_body_retry_avoided(
+            &peer,
+            super::super::test_work_scope(),
+            block::Hash([byte; 32]),
+            Instant::now()
+        ));
+    }
     assert!(!registry.is_body_retry_avoided(
         &peer,
+        super::super::test_work_scope(),
+        block::Hash([4; 32]),
+        Instant::now()
+    ));
+    let other_peer = ZakuraPeerId::new(vec![255; 32]).unwrap();
+    assert!(!registry.is_body_retry_avoided(
+        &other_peer,
         super::super::test_work_scope(),
         block::Hash([2; 32]),
         Instant::now()

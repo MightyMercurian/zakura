@@ -603,38 +603,37 @@ impl PeerRoutine {
             }
         }
 
-        let authorized_height = if let Some(requester) = &self.requester {
-            use super::regulated::live_requester::Authorization;
-            match requester.authorize(&frame)? {
-                Authorization::Block(height) => Some(height),
-                Authorization::Control => None,
-                Authorization::IncompatibleHeader => {
-                    // Height-only requests cannot identify which live range the
-                    // unexpected header belongs to. Defer each still-wanted next
-                    // body for this supplier without delaying other suppliers.
-                    let bodies =
-                        requester
-                            .next_expected()
-                            .into_iter()
-                            .filter_map(|(height, hash)| {
+        let authorized_height =
+            if let Some(requester) = &self.requester {
+                use super::regulated::live_requester::Authorization;
+                match requester.authorize(&frame)? {
+                    Authorization::Block(height) => Some(height),
+                    Authorization::Control => None,
+                    Authorization::IncompatibleHeader => {
+                        // Height-only requests cannot identify which live range the
+                        // unexpected header belongs to. Defer each still-wanted
+                        // body for this supplier without delaying other suppliers.
+                        let bodies = requester.unreceived_expected().into_iter().filter_map(
+                            |(height, hash)| {
                                 self.work
                                     .item_for_height(height)
                                     .filter(|item| item.hash == hash)
                                     .map(|item| (item.scope, hash))
-                            });
-                    self.registry.defer_incompatible_bodies(
-                        self.source,
-                        bodies,
-                        Instant::now() + self.config.effective_liveness_timeout(),
-                    );
-                    return Err(SinkReject::local(
-                        "GetBlocks header does not match the next expected header",
-                    ));
+                            },
+                        );
+                        self.registry.defer_incompatible_bodies(
+                            self.source,
+                            bodies,
+                            Instant::now() + self.config.effective_liveness_timeout(),
+                        );
+                        return Err(SinkReject::local(
+                            "GetBlocks header does not match the next expected header",
+                        ));
+                    }
                 }
-            }
-        } else {
-            None
-        };
+            } else {
+                None
+            };
         let frame_payload_bytes = frame.payload.len();
         let body_permit = if is_block_frame(&frame) {
             let permit = self.reserve_body_decode_permit();

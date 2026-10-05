@@ -105,8 +105,8 @@ impl LiveRequester {
         }
     }
 
-    pub(crate) fn next_expected(&self) -> Vec<(block::Height, block::Hash)> {
-        self.shared.lock().next_expected()
+    pub(crate) fn unreceived_expected(&self) -> Vec<(block::Height, block::Hash)> {
+        self.shared.lock().unreceived_expected()
     }
 
     pub(crate) fn len(&self) -> usize {

@@ -88,13 +88,21 @@ impl Requester {
         }
     }
 
-    pub(super) fn next_expected(&self) -> Vec<(Height, Hash)> {
-        self.next
-            .iter()
-            .map(|(hash, start)| {
-                let pending = &self.ranges[start];
-                // Received never exceeds the protocol's 128-block request limit.
-                (Height(start.0 + pending.received as u32), *hash)
+    /// Unreceived bodies from every live exchange share a supplier cooldown
+    /// after an incompatible header makes the whole connection unusable.
+    pub(super) fn unreceived_expected(&self) -> Vec<(Height, Hash)> {
+        self.ranges
+            .values()
+            .flat_map(|pending| {
+                pending
+                    .expected
+                    .iter()
+                    .enumerate()
+                    .skip(pending.received)
+                    .map(|(offset, hash)| {
+                        // A validated range contains at most 128 heights without overflow.
+                        (Height(pending.range.start.0 + offset as u32), *hash)
+                    })
             })
             .collect()
     }
