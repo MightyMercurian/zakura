@@ -1356,6 +1356,22 @@ mod tests {
         }
 
         if mostly_old {
+            let upgraded = bystanders.last().unwrap();
+            for message in [
+                BlockSyncMessage::Status(BlockSyncStatus::default()),
+                BlockSyncMessage::GetBlocks {
+                    start_height,
+                    count,
+                },
+            ] {
+                upgraded
+                    .send_ordered_raw_frame_with_version(
+                        ZAKURA_STREAM_BLOCK_SYNC,
+                        ZAKURA_REGULATED_BLOCK_SYNC_STREAM_VERSION,
+                        message.encode_frame()?,
+                    )
+                    .await?;
+            }
             // Old requesters can repeat a range before its ending. Both requests
             // must stay on the v2 serving path even though this node supports v3.
             for _ in 0..2 {
@@ -1381,25 +1397,73 @@ mod tests {
                 )
                 .await?;
             tokio::time::timeout(Duration::from_secs(5), async {
-                loop {
+                let mut retried = false;
+                let mut served = 0;
+                while !retried || served < 2 {
                     let frame = hostile
                         .recv_ordered_frame_with_version(ZAKURA_STREAM_BLOCK_SYNC, version)
                         .await?;
-                    if let BlockSyncMessage::GetBlocks {
-                        start_height: retry,
-                        count: retried,
-                    } = BlockSyncMessage::decode_frame(frame)?
-                    {
-                        assert!(retry > start_height);
-                        assert!(retried > 0 && retry.0 < start_height.0 + count);
-                        return Ok::<_, BoxError>(());
+                    match BlockSyncMessage::decode_frame(frame)? {
+                        BlockSyncMessage::GetBlocks {
+                            start_height: retry,
+                            count: retry_count,
+                        } => {
+                            assert!(retry > start_height);
+                            assert!(retry_count > 0 && retry.0 < start_height.0 + count);
+                            retried = true;
+                        }
+                        // The fixture's old serving driver returns no stored bodies.
+                        // Each overlapping request must nevertheless finish exactly once.
+                        BlockSyncMessage::RangeUnavailable {
+                            start_height: start,
+                            count: unavailable,
+                        } => {
+                            assert_eq!(start, start_height);
+                            assert_eq!(unavailable, count);
+                            served += 1;
+                        }
+                        BlockSyncMessage::Status(_) => {}
+                        message => panic!("unexpected old serving response: {message:?}"),
+                    }
+                }
+                Ok::<_, BoxError>(())
+            })
+            .await
+            .map_err(|_| -> BoxError {
+                "old peer did not receive both endings and an overlapping timeout retry".into()
+            })??;
+
+            let upgraded_hashes = tokio::time::timeout(Duration::from_secs(5), async {
+                let mut hashes = Vec::new();
+                loop {
+                    let frame = upgraded
+                        .recv_ordered_frame_with_version(
+                            ZAKURA_STREAM_BLOCK_SYNC,
+                            ZAKURA_REGULATED_BLOCK_SYNC_STREAM_VERSION,
+                        )
+                        .await?;
+                    match BlockSyncMessage::decode_frame(frame)? {
+                        BlockSyncMessage::Status(_) => {}
+                        BlockSyncMessage::Block(block) => hashes.push(block.hash()),
+                        BlockSyncMessage::BlocksDone {
+                            start_height: start,
+                            returned,
+                        } => {
+                            assert_eq!((start, returned), (start_height, count));
+                            return Ok::<_, BoxError>(hashes);
+                        }
+                        message => panic!("unexpected concurrent v3 response: {message:?}"),
                     }
                 }
             })
             .await
             .map_err(|_| -> BoxError {
-                "old peer never received the overlapping timeout retry".into()
+                "v3 serving did not progress alongside the old peer's retries".into()
             })??;
+            assert_eq!(
+                upgraded_hashes,
+                blocks.iter().map(|block| block.hash()).collect::<Vec<_>>()
+            );
         }
 
         let end_height = start_height
@@ -1513,7 +1577,7 @@ mod tests {
                 Duration::from_secs(5),
                 || {
                     let peers = victim.block_sync().unwrap().peer_snapshot();
-                    peers.inbound_peers + peers.outbound_peers == 0
+                    peers.inbound_peers + peers.outbound_peers == 1
                 },
             )
             .await?;
