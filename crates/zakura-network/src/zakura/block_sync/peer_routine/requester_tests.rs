@@ -761,6 +761,7 @@ async fn a_withheld_ending_retires_after_reading_resumes_from_a_local_pause() {
         .await
         .unwrap();
     assert!(futures::poll!(&mut running).is_pending());
+    let claimed_at = time::Instant::now();
     // The first range has its body, but no ending. Its clock runs for ten seconds.
     assert_eq!(received.len(), 1);
     outbound.recv().await.unwrap();
@@ -785,7 +786,12 @@ async fn a_withheld_ending_retires_after_reading_resumes_from_a_local_pause() {
     assert!(futures::poll!(&mut running).is_pending());
     assert!(!connection.is_cancelled());
     time::advance(Duration::from_secs(1)).await;
-    assert!(matches!(running.await, Err(SinkReject::Local(_))));
+    assert_eq!(time::Instant::now() - claimed_at, Duration::from_secs(72));
+    // Poll at this instant. Awaiting would let paused time advance to a later deadline.
+    assert!(matches!(
+        futures::poll!(&mut running),
+        std::task::Poll::Ready(Err(SinkReject::Local(_)))
+    ));
     assert!(connection.is_cancelled());
     assert_eq!(pool.held(), 0);
 }
