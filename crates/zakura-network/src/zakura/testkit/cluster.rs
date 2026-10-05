@@ -848,12 +848,23 @@ mod tests {
                             .await;
                     }
                     BlockSyncAction::QueryBlocksByHeightRange { peer, start, count } => {
+                        let selected = by_height
+                            .range(start..)
+                            .take(usize::try_from(count).unwrap())
+                            .map(|(height, block)| {
+                                (
+                                    *height,
+                                    block.clone(),
+                                    usize::try_from(block_size(block)).unwrap(),
+                                )
+                            })
+                            .collect();
                         let _ = handle
-                            .send(BlockSyncEvent::BlockRangeResponseFinished {
+                            .send(BlockSyncEvent::BlockRangeResponseReady {
                                 peer,
                                 start_height: start,
                                 requested_count: count,
-                                returned_count: 0,
+                                blocks: selected,
                             })
                             .await;
                     }
@@ -1391,21 +1402,6 @@ mod tests {
                     )
                     .await?;
             }
-            // Old requesters can repeat a range before its ending. Both requests
-            // must stay on the v2 serving path even though this node supports v3.
-            for _ in 0..2 {
-                hostile
-                    .send_ordered_raw_frame_with_version(
-                        ZAKURA_STREAM_BLOCK_SYNC,
-                        version,
-                        BlockSyncMessage::GetBlocks {
-                            start_height,
-                            count,
-                        }
-                        .encode_frame()?,
-                    )
-                    .await?;
-            }
             // Give one body as progress, then withhold the rest until our v2
             // requester retries the still-live range without a BlocksDone.
             hostile
@@ -1415,43 +1411,49 @@ mod tests {
                     BlockSyncMessage::Block(blocks[0].clone()).encode_frame()?,
                 )
                 .await?;
-            tokio::time::timeout(Duration::from_secs(5), async {
-                let mut retried = false;
-                let mut served = 0;
-                while !retried || served < 2 {
-                    let frame = hostile
-                        .recv_ordered_frame_with_version(ZAKURA_STREAM_BLOCK_SYNC, version)
-                        .await?;
-                    match BlockSyncMessage::decode_frame(frame)? {
-                        BlockSyncMessage::GetBlocks {
-                            start_height: retry,
-                            count: retry_count,
-                        } => {
-                            assert!(retry > start_height);
-                            assert!(retry_count > 0 && retry.0 < start_height.0 + count);
-                            retried = true;
-                        }
-                        // The fixture's old serving driver returns no stored bodies.
-                        // Each overlapping request must nevertheless finish exactly once.
-                        BlockSyncMessage::RangeUnavailable {
-                            start_height: start,
-                            count: unavailable,
-                        } => {
-                            assert_eq!(start, start_height);
-                            assert_eq!(unavailable, count);
-                            served += 1;
-                        }
-                        BlockSyncMessage::Status(_) => {}
-                        message => panic!("unexpected old serving response: {message:?}"),
+            // A committed body changes the v2 serving range. Its correction must
+            // arrive promptly, without inheriting the v3 thirty-second cadence.
+            tokio::time::timeout(Duration::from_secs(1), async {
+                loop {
+                    let frame = hostile.recv_ordered_frame_with_version(ZAKURA_STREAM_BLOCK_SYNC, version).await?;
+                    if matches!(BlockSyncMessage::decode_frame(frame)?, BlockSyncMessage::Status(status) if status.servable_high >= block::Height(1)) {
+                        return Ok::<_, BoxError>(());
                     }
                 }
-                Ok::<_, BoxError>(())
-            })
-            .await
-            .map_err(|_| -> BoxError {
-                "old peer did not receive both endings and an overlapping timeout retry".into()
-            })??;
-
+            }).await.map_err(|_| -> BoxError { "v2 range correction missed one second".into() })??;
+            // Old requesters can repeat a range before its ending. Both requests
+            // must stay on the v2 serving path even though this node supports v3.
+            for _ in 0..2 {
+                hostile
+                    .send_ordered_raw_frame_with_version(
+                        ZAKURA_STREAM_BLOCK_SYNC,
+                        version,
+                        BlockSyncMessage::GetBlocks {
+                            start_height,
+                            count: 1,
+                        }
+                        .encode_frame()?,
+                    )
+                    .await?;
+            }
+            // Every old peer actively requests bodies while the upgraded peer
+            // serves its range and the original old supplier withholds endings.
+            for old in &bystanders[..4] {
+                for message in [
+                    BlockSyncMessage::Status(BlockSyncStatus::default()),
+                    BlockSyncMessage::GetBlocks {
+                        start_height,
+                        count: 1,
+                    },
+                ] {
+                    old.send_ordered_raw_frame_with_version(
+                        ZAKURA_STREAM_BLOCK_SYNC,
+                        version,
+                        message.encode_frame()?,
+                    )
+                    .await?;
+                }
+            }
             let upgraded_hashes = tokio::time::timeout(Duration::from_secs(5), async {
                 let mut hashes = Vec::new();
                 loop {
@@ -1483,6 +1485,71 @@ mod tests {
                 upgraded_hashes,
                 blocks.iter().map(|block| block.hash()).collect::<Vec<_>>()
             );
+            tokio::time::timeout(Duration::from_secs(5), async {
+                let mut retried = false;
+                let mut served = 0;
+                let mut served_bodies = 0;
+                while !retried || served < 2 {
+                    let frame = hostile
+                        .recv_ordered_frame_with_version(ZAKURA_STREAM_BLOCK_SYNC, version)
+                        .await?;
+                    match BlockSyncMessage::decode_frame(frame)? {
+                        BlockSyncMessage::GetBlocks {
+                            start_height: retry,
+                            count: retry_count,
+                        } => {
+                            assert!(retry > start_height);
+                            assert!(retry_count > 0 && retry.0 < start_height.0 + count);
+                            retried = true;
+                        }
+                        BlockSyncMessage::Block(block) => {
+                            assert_eq!(block.hash(), blocks[0].hash());
+                            served_bodies += 1;
+                        }
+                        BlockSyncMessage::BlocksDone {
+                            start_height: start,
+                            returned,
+                        } => {
+                            assert_eq!((start, returned), (start_height, 1));
+                            served += 1;
+                        }
+                        BlockSyncMessage::Status(_) => {}
+                        message => panic!("unexpected old serving response: {message:?}"),
+                    }
+                }
+                assert_eq!(served_bodies, 2);
+                Ok::<_, BoxError>(())
+            })
+            .await
+            .map_err(|_| -> BoxError {
+                "old peer did not receive both endings and an overlapping timeout retry".into()
+            })??;
+
+            for old in &bystanders[..4] {
+                let mut bodies = 0;
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    loop {
+                        let frame = old
+                            .recv_ordered_frame_with_version(ZAKURA_STREAM_BLOCK_SYNC, version)
+                            .await?;
+                        match BlockSyncMessage::decode_frame(frame)? {
+                            BlockSyncMessage::Status(_) => {}
+                            BlockSyncMessage::Block(block) => {
+                                assert_eq!(block.hash(), blocks[0].hash());
+                                bodies += 1;
+                            }
+                            BlockSyncMessage::BlocksDone { returned, .. } => {
+                                assert_eq!((returned, bodies), (1, 1));
+                                break;
+                            }
+                            message => panic!("unexpected active old peer response: {message:?}"),
+                        }
+                    }
+                    Ok::<_, BoxError>(())
+                })
+                .await
+                .map_err(|_| -> BoxError { "active old peer did not receive its body".into() })??;
+            }
         }
 
         let end_height = start_height
@@ -1596,7 +1663,7 @@ mod tests {
                 Duration::from_secs(5),
                 || {
                     let peers = victim.block_sync().unwrap().peer_snapshot();
-                    peers.inbound_peers + peers.outbound_peers == 1
+                    peers.inbound_peers + peers.outbound_peers == 5
                 },
             )
             .await?;
