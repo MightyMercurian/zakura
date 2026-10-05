@@ -623,3 +623,61 @@ async fn buffered_ending_survives_a_long_local_decode_wait() {
     assert_eq!(pool.held(), 0);
     assert!(!connection.is_cancelled());
 }
+
+#[tokio::test]
+async fn a_live_partially_returned_range_waits_without_retry_spin() {
+    let (mut routine, mut outbound, _, connection) = requester_routine(block::Hash([1; 32]));
+    routine.config.max_blocks_per_response = 2;
+    routine.max_blocks_per_response = 2;
+    routine.work.extend(
+        super::super::test_work_scope(),
+        [(
+            block::Height(2),
+            block::Hash([2; 32]),
+            BlockSizeEstimate::Confirmed(1000),
+        )],
+    );
+    routine.try_fill().await;
+    outbound.recv().await.unwrap();
+    assert_eq!(routine.window.outstanding.len(), 1);
+    let owner = routine.window.outstanding[0].request.owner;
+    // A central scheduler may return one height while this request still owns
+    // the rest. Its wire authorization is live and has not begun retirement.
+    let returned = routine
+        .work
+        .release_reserved_and_return_items_detailed_for_owner(owner, [block::Height(1)]);
+    routine.budget.release(returned.released_bytes);
+    assert_eq!(returned.returned_count, 1);
+    assert_eq!(
+        routine
+            .requester
+            .as_ref()
+            .unwrap()
+            .retirement_deadline(routine.config.effective_liveness_timeout()),
+        None
+    );
+    assert_eq!(routine.try_fill().await, None);
+    assert!(routine.work.pending_contains(block::Height(1)));
+    let before = routine.next_request_id.unwrap().get();
+    let (_input, recv) = crate::zakura::framed_channel(4);
+    routine.recv = recv;
+    let (_view, view_rx) = watch::channel(*routine.sequencer_view.borrow());
+    routine.sequencer_view = view_rx;
+    let mut guard = block_sync_guard();
+    let mut running = Box::pin(routine.run_inner(&mut guard));
+    for _ in 0..100 {
+        assert!(futures::poll!(&mut running).is_pending());
+    }
+    drop(running);
+    assert!(routine.next_request_id.unwrap().get() - before <= 2);
+    assert_eq!(routine.window.outstanding.len(), 1);
+    assert!(!connection.is_cancelled());
+}
+
+#[tokio::test]
+async fn a_disappeared_avoidance_timer_still_retries_immediately() {
+    let (routine, _, _, _) = requester_routine(block::Hash([1; 32]));
+    let now = Instant::now();
+    assert_eq!(routine.retry_filter_wake_deadline(now, true), Some(now));
+    assert_eq!(routine.retry_filter_wake_deadline(now, false), None);
+}

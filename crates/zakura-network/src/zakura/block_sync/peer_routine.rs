@@ -1158,24 +1158,30 @@ impl PeerRoutine {
             // avoided, break — the routine wakes to retry when the avoid window
             // expires (see `earliest_deadline_sleep`).
             {
-                let is_allowed = |height: &block::Height, item: &WorkItem| {
-                    !self
+                let mut timed_rejection = false;
+                let mut is_allowed = |height: &block::Height, item: &WorkItem| {
+                    if self
                         .requester
                         .as_ref()
                         .is_some_and(|requester| requester.blocks_retry(*height))
-                        && !self.retry_avoid.contains_key(height)
-                        && !self
+                    {
+                        return false;
+                    }
+                    let avoided = self.retry_avoid.contains_key(height)
+                        || self
                             .registry
                             .is_floor_height_avoided(&self.peer, *height, now)
-                        && !self
+                        || self
                             .registry
-                            .is_body_retry_avoided(&self.peer, item.scope, item.hash, now)
+                            .is_body_retry_avoided(&self.peer, item.scope, item.hash, now);
+                    timed_rejection |= avoided;
+                    !avoided
                 };
                 let Some(keep) =
                     first_allowed_run(&items, |(height, item)| is_allowed(height, item))
                 else {
                     self.work.return_unpublished(&items);
-                    retry_filter_deadline = Some(self.retry_filter_wake_deadline(now));
+                    retry_filter_deadline = self.retry_filter_wake_deadline(now, timed_rejection);
                     break FillStop::RetryAvoid;
                 };
                 let keep_len = keep.len();
@@ -1191,11 +1197,13 @@ impl PeerRoutine {
                     returned_avoided = true;
                 }
                 if returned_avoided {
-                    let deadline = self.retry_filter_wake_deadline(now);
-                    retry_filter_deadline = Some(
-                        retry_filter_deadline
-                            .map_or(deadline, |current: Instant| current.min(deadline)),
-                    );
+                    retry_filter_deadline = [
+                        retry_filter_deadline,
+                        self.retry_filter_wake_deadline(now, timed_rejection),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .min();
                 }
             }
             self.trace_work_taken(servable_low, servable_high, items.len());
@@ -1421,20 +1429,21 @@ impl PeerRoutine {
         retry_filter_deadline
     }
 
-    /// Capture the retry deadline against the same time snapshot that rejected
-    /// the work. If shared state changed after filtering, retry immediately.
-    fn retry_filter_wake_deadline(&self, now: Instant) -> Instant {
+    /// Live ranges wake through responses or their request/retirement deadlines.
+    /// Retry immediately only when a timed rejection disappeared after filtering.
+    fn retry_filter_wake_deadline(&self, now: Instant, timed_rejection: bool) -> Option<Instant> {
         let local = self.retry_avoid.values().min().copied();
         let floor = self.registry.next_floor_avoid_deadline(&self.peer, now);
         let body = self.registry.next_body_retry_deadline(&self.peer, now);
         let ending = self.requester.as_ref().and_then(|requester| {
             requester.retirement_deadline(self.config.effective_liveness_timeout())
         });
-        [local, floor, body, ending]
+        let timed = [local, floor, body]
             .into_iter()
             .flatten()
             .min()
-            .unwrap_or(now)
+            .or_else(|| timed_rejection.then_some(now));
+        [timed, ending].into_iter().flatten().min()
     }
 
     fn admission_snapshot(&self, view: &SequencerView) -> AdmissionSnapshot {
