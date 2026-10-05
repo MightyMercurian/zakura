@@ -55,6 +55,7 @@ impl Serving {
         send: FramedSend,
         cancel: CancellationToken,
         connection: CancellationToken,
+        close_cause: crate::zakura::CloseCause,
     ) -> ServingSession {
         let producer = Server::new(self.source.clone(), self.max_blocks, self.max_body_bytes)
             .expect("advertised serving limits are within the protocol bounds")
@@ -67,6 +68,7 @@ impl Serving {
                 send,
                 cancel,
                 connection,
+                close_cause,
             ),
             ranges: BTreeMap::new(),
             completed: FuturesUnordered::new(),

@@ -82,7 +82,13 @@ async fn serving_capacity_candidates() {
             let cancel = CancellationToken::new();
             let peer = ZakuraPeerId::new(vec![17; 32]).unwrap();
             let (send, mut output) = framed_channel(64);
-            let mut session = serving.session(&peer, send, cancel.clone(), cancel.clone());
+            let mut session = serving.session(
+                &peer,
+                send,
+                cancel.clone(),
+                cancel.clone(),
+                crate::zakura::CloseCause::default(),
+            );
             let (mut issued, mut completed, mut bodies, mut wire_bytes) =
                 (0_u32, 0_u32, 0_u32, 0_u64);
             let started = std::time::Instant::now();
@@ -140,6 +146,7 @@ async fn waiting_commitment_allocation_breakdown() {
             send,
             cancel.clone(),
             cancel.clone(),
+            crate::zakura::CloseCause::default(),
         );
         let mut completions = Vec::with_capacity(usize::try_from(count).unwrap());
         let (_, measured) = zakura_test::allocations::measure(|| {
@@ -232,6 +239,7 @@ async fn compact_waiting_containers() {
         send,
         cancel.clone(),
         cancel.clone(),
+        crate::zakura::CloseCause::default(),
     );
     // A shared range index can carry a generation rather than a watch channel
     // and per-entry future. Production would still need atomic completion and

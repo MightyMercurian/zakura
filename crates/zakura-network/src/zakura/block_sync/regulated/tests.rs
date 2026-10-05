@@ -391,6 +391,7 @@ fn envelope_allocations_are_bounded_by_the_payload() {
 }
 
 struct LiveServing {
+    close_cause: crate::zakura::CloseCause,
     service: crate::zakura::BlockSyncService,
     input: crate::zakura::FramedSend,
     output: crate::zakura::FramedRecv,
@@ -418,6 +419,7 @@ fn live_serving(source: Arc<Store>, max_bytes: u32) -> LiveServing {
         ..Default::default()
     };
     let cancel = CancellationToken::new();
+    let close_cause = crate::zakura::CloseCause::default();
     let mut startup =
         super::super::BlockSyncStartup::inert(config.clone()).with_range_source(source);
     startup.shutdown = cancel.clone();
@@ -448,9 +450,10 @@ fn live_serving(source: Arc<Store>, max_bytes: u32) -> LiveServing {
             ),
         )]),
         cancel.clone(),
-        crate::zakura::CloseCause::default(),
+        close_cause.clone(),
     ));
     LiveServing {
+        close_cause,
         service,
         input,
         output,
@@ -489,6 +492,7 @@ async fn live_serving_encoder_panic_closes_the_connection_without_downloads() {
     tokio::time::timeout(Duration::from_secs(5), live.cancel.cancelled())
         .await
         .unwrap();
+    assert_eq!(live.close_cause.get_or("cancelled"), "service_panic");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -633,6 +637,7 @@ async fn a_timed_out_read_keeps_the_same_peer_budget_after_its_output_drains() {
         send,
         cancel.clone(),
         cancel.clone(),
+        crate::zakura::CloseCause::default(),
     );
     let range = Range::new(block::Height(1), 1).unwrap();
     serving.admit(range).unwrap();
@@ -694,7 +699,13 @@ fn measure_waiting_getblocks_capacity(peers: usize, config: &super::super::Zakur
                 identity[..8].copy_from_slice(&u64::try_from(index).unwrap().to_le_bytes());
                 let peer = ZakuraPeerId::new(identity).unwrap();
                 let (send, output) = framed_channel(4);
-                let mut session = serving.session(&peer, send, cancel.clone(), cancel.clone());
+                let mut session = serving.session(
+                    &peer,
+                    send,
+                    cancel.clone(),
+                    cancel.clone(),
+                    crate::zakura::CloseCause::default(),
+                );
                 for height in 1..=count {
                     session.admit(block::Height(height), 1).unwrap();
                 }
