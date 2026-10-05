@@ -742,7 +742,7 @@ report or penalty. Height-only requests do not commit the publisher to the reque
 The receiver MUST retain the exchange fences until connection cleanup and requeue unreceived work.
 Local waits for decode or sequencer capacity MUST pause the ending deadline. Crediting local waits
 MUST NOT release reservations or excuse a withheld ending while the reader remains active.
-It SHOULD briefly avoid this supplier for the still-wanted next bodies, including across reconnects,
+It SHOULD briefly avoid this supplier for the still-wanted unreceived bodies in every live exchange, including across reconnects,
 without delaying other suppliers. Invalid framing, excess response bytes, and invalid endings remain
 protocol violations. The publisher MUST send the blocks of a range in ascending height order. The reservation identity commits to a header that header sync already validated, so
 Verify re-checks Equihash and the target only as defense in depth. An implementation MAY skip both
