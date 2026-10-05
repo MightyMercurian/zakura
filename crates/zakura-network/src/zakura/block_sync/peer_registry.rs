@@ -436,14 +436,16 @@ impl PeerRegistry {
             BodyRetryKey::new(current, hash),
             BodyRetryKey::new(scope, hash),
         ];
-        // Alarm publication and supplier deferral can precede the registry refresh.
-        // Check both snapshots without crossing a body-work epoch.
-        keys.into_iter().any(|key| {
-            all_retries.contains_key(&key)
-                || [BodyRetryReason::Unavailable, BodyRetryReason::Incompatible]
+        // There is at most one published alarm. Its exact body stays suppressed
+        // across compatible snapshots, including before either reader has refreshed.
+        all_retries
+            .keys()
+            .any(|key| key.hash == hash && key.body_work_epoch == scope.body_work_epoch)
+            || keys.into_iter().any(|key| {
+                [BodyRetryReason::Unavailable, BodyRetryReason::Incompatible]
                     .into_iter()
                     .any(|reason| retries.entries.contains_key(&(source, key, reason)))
-        })
+            })
     }
 
     pub(super) fn next_body_retry_deadline(
@@ -1327,6 +1329,46 @@ mod floor_bias_tests {
         }
     }
 
+    /// A newly published alarm covers old takes without changing unrelated supplier cooldowns.
+    #[test]
+    fn published_alarm_covers_old_takes_without_moving_supplier_authority() {
+        let registry = PeerRegistry::new();
+        let old = super::super::test_work_scope();
+        let refreshed = zakura_header_chain::BodyWorkAuthority {
+            header: zakura_header_chain::HeaderWorkAuthority {
+                header_generation: old.header_generation.checked_next().unwrap(),
+                ..old.header
+            },
+            ..old
+        };
+        let supplier = peer(1);
+        let source = zakura_header_chain::SourceId::from_digest(supplier.digest());
+        let alarm_hash = block::Hash([8; 32]);
+        let other_hash = block::Hash([9; 32]);
+        let now = Instant::now();
+        let until = now + Duration::from_secs(60);
+        registry.refresh_body_retry_scope(old);
+        registry.defer_body_retry([source], old, other_hash, until);
+        registry.set_persisted_body_alarm(Some((refreshed, alarm_hash, until)));
+        for caller in [old, refreshed] {
+            assert!(registry.is_body_retry_avoided(&supplier, caller, alarm_hash, now));
+            assert!(registry.is_body_retry_avoided(&peer(2), caller, alarm_hash, now));
+            assert!(registry.is_body_retry_avoided(&supplier, caller, other_hash, now));
+            assert!(!registry.is_body_retry_avoided(&peer(2), caller, other_hash, now));
+        }
+        let reset = zakura_header_chain::BodyWorkAuthority {
+            body_work_epoch: old.body_work_epoch.checked_next().unwrap(),
+            ..refreshed
+        };
+        assert!(!registry.is_body_retry_avoided(&supplier, reset, alarm_hash, now));
+        // Clearing an obsolete snapshot cannot clear the newly published alarm.
+        registry.clear_body_retry(old, alarm_hash);
+        assert!(registry.is_body_retry_avoided(&supplier, old, alarm_hash, now));
+        registry.set_persisted_body_alarm(None);
+        assert!(!registry.is_body_retry_avoided(&supplier, old, alarm_hash, now));
+        assert!(registry.is_body_retry_avoided(&supplier, refreshed, other_hash, now));
+    }
+
     /// An older sequencer notification cannot adopt or erase a newly published alarm.
     #[test]
     fn persisted_alarm_survives_older_refreshes_and_pending_resets() {
@@ -1607,10 +1649,7 @@ mod floor_bias_tests {
         assert!(!reg.is_body_retry_avoided(
             &first,
             zakura_header_chain::BodyWorkAuthority {
-                header: zakura_header_chain::HeaderWorkAuthority {
-                    header_generation: zakura_header_chain::HeaderGeneration::new(10),
-                    ..scope.header
-                },
+                body_work_epoch: scope.body_work_epoch.checked_next().unwrap(),
                 ..scope
             },
             hash,
