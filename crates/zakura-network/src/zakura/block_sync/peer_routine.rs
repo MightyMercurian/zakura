@@ -759,7 +759,7 @@ impl PeerRoutine {
             .as_ref()
             .map(|requester| requester.pause_reading());
         let capacity_before = self.sequencer_input.capacity();
-        let started = time::Instant::now().into_std();
+        let started = time::Instant::now();
         let permit = self
             .sequencer_input
             .clone()
@@ -1865,7 +1865,7 @@ impl PeerRoutine {
         let estimated_bytes = outstanding.estimated_bytes_for_height(height).unwrap_or(0);
         let request_start_height = outstanding.request.start_height;
         let request_range_count = outstanding.request.count;
-        let request_elapsed = outstanding.queued_at.elapsed();
+        let request_elapsed = time::Instant::from_std(outstanding.queued_at).elapsed();
         let request_elapsed_ms = elapsed_ms_u64(request_elapsed);
 
         // The body's transactions are not validated against the header here;
@@ -2010,7 +2010,7 @@ impl PeerRoutine {
         body_permit: Option<mpsc::OwnedPermit<SequencedBody>>,
     ) {
         let received_at = time::Instant::now().into_std();
-        let sequencer_send_started = time::Instant::now().into_std();
+        let sequencer_send_started = time::Instant::now();
         let body = SequencedBody::new_queued(
             owner,
             self.source,
@@ -2304,7 +2304,9 @@ impl PeerRoutine {
         self.trace_range_unavailable(
             start_height,
             Some(outstanding.request.count),
-            Some(elapsed_ms_u64(outstanding.queued_at.elapsed())),
+            Some(elapsed_ms_u64(
+                time::Instant::from_std(outstanding.queued_at).elapsed(),
+            )),
         );
         let disposition = self.stale_adjusted_disposition(index, Disposition::RetryOriginal);
         self.charge_short_response_reliability(index, disposition);
