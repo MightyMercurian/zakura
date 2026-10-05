@@ -341,6 +341,7 @@ impl PeerRegistry {
         self.body_retry_all_lock().remove(&key);
     }
 
+    /// Retire old work while preserving alarms and incompatibility reports from newer work.
     pub(super) fn retain_body_retry_scope(
         &self,
         current: Option<zakura_header_chain::BodyWorkAuthority>,
@@ -366,13 +367,20 @@ impl PeerRegistry {
                     Some(((source, key, reason), deadline))
                 },
             ));
-        all_retries.retain(|key, _| {
-            current.is_some_and(|scope| {
-                key.header_generation == scope.header_generation
-                    && key.branch == scope.branch
-                    && key.body_work_epoch == scope.body_work_epoch
+        *all_retries = std::mem::take(&mut *all_retries)
+            .into_iter()
+            .filter_map(|(mut key, deadline)| {
+                let scope = current?;
+                if key.body_work_epoch < scope.body_work_epoch {
+                    return None;
+                }
+                if key.body_work_epoch == scope.body_work_epoch {
+                    key = BodyRetryKey::new(scope, key.hash);
+                }
+                // The reactor can publish a newer alarm before this reset is processed.
+                Some((key, deadline))
             })
-        });
+            .collect();
     }
 
     /// Carry suppression deadlines through a compatible authority refresh.
@@ -387,9 +395,9 @@ impl PeerRegistry {
         *all_retries = std::mem::take(&mut *all_retries)
             .into_iter()
             .map(|(mut key, deadline)| {
-                key.header_generation = current.header_generation;
-                key.branch = current.branch;
-                key.body_work_epoch = current.body_work_epoch;
+                if key.body_work_epoch == current.body_work_epoch {
+                    key = BodyRetryKey::new(current, key.hash);
+                }
                 (key, deadline)
             })
             .collect();
@@ -1317,6 +1325,56 @@ mod floor_bias_tests {
                 assert!(!registry.is_body_retry_avoided(&supplier, caller, hash, now));
             }
         }
+    }
+
+    /// An older sequencer notification cannot adopt or erase a newly published alarm.
+    #[test]
+    fn persisted_alarm_survives_older_refreshes_and_pending_resets() {
+        let registry = PeerRegistry::new();
+        let old = super::super::test_work_scope();
+        let intermediate = zakura_header_chain::BodyWorkAuthority {
+            body_work_epoch: old.body_work_epoch.checked_next().unwrap(),
+            ..old
+        };
+        let fresh = zakura_header_chain::BodyWorkAuthority {
+            header: zakura_header_chain::HeaderWorkAuthority {
+                header_generation: old.header_generation.checked_next().unwrap(),
+                ..old.header
+            },
+            body_work_epoch: intermediate.body_work_epoch.checked_next().unwrap(),
+            ..intermediate
+        };
+        let supplier = peer(1);
+        let hash = block::Hash([8; 32]);
+        let now = Instant::now();
+        let until = now + Duration::from_secs(60);
+        registry.refresh_body_retry_scope(old);
+        registry.set_persisted_body_alarm(Some((fresh, hash, until)));
+        registry.refresh_body_retry_scope(old);
+        assert!(!registry.is_body_retry_avoided(&supplier, old, hash, now));
+        assert!(registry.is_body_retry_avoided(&supplier, fresh, hash, now));
+        registry.retain_body_retry_scope(Some(intermediate));
+        assert!(!registry.is_body_retry_avoided(&supplier, intermediate, hash, now));
+        assert!(registry.is_body_retry_avoided(&supplier, fresh, hash, now));
+        registry.retain_body_retry_scope(Some(zakura_header_chain::BodyWorkAuthority {
+            header: old.header,
+            ..fresh
+        }));
+        assert!(registry.is_body_retry_avoided(&supplier, fresh, hash, now));
+        registry.refresh_body_retry_scope(fresh);
+        assert!(registry.is_body_retry_avoided(&supplier, fresh, hash, now));
+        assert!(registry.is_body_retry_avoided(&peer(2), fresh, hash, now));
+        assert_eq!(
+            registry.next_body_retry_deadline(&supplier, now),
+            Some(until)
+        );
+        assert!(!registry.is_body_retry_avoided(&supplier, fresh, hash, until));
+        registry.set_persisted_body_alarm(Some((fresh, hash, until)));
+        registry.retain_body_retry_scope(Some(zakura_header_chain::BodyWorkAuthority {
+            body_work_epoch: fresh.body_work_epoch.checked_next().unwrap(),
+            ..fresh
+        }));
+        assert!(!registry.is_body_retry_avoided(&supplier, fresh, hash, now));
     }
 
     /// A cooldown reported before its reset notification survives without blocking old work.
