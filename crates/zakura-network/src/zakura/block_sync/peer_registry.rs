@@ -381,6 +381,7 @@ impl PeerRegistry {
             .collect();
     }
 
+    /// Match supplier cooldowns using the registry's authority while work snapshots refresh.
     pub(super) fn is_body_retry_avoided(
         &self,
         peer: &ZakuraPeerId,
@@ -388,50 +389,23 @@ impl PeerRegistry {
         hash: block::Hash,
         now: Instant,
     ) -> bool {
-        let key = BodyRetryKey::new(scope, hash);
         let source = zakura_header_chain::SourceId::from_digest(peer.digest());
         let mut all_retries = self.body_retry_all_lock();
-        all_retries.retain(|_, until| *until > now);
-        if all_retries.get(&key).is_some_and(|until| *until > now) {
-            return true;
-        }
         let mut retries = self.body_retry_lock();
-        retries.entries.retain(|_, until| *until > now);
-        [BodyRetryReason::Unavailable, BodyRetryReason::Incompatible]
-            .into_iter()
-            .any(|reason| {
-                retries
-                    .entries
-                    .get(&(source, key, reason))
-                    .is_some_and(|until| *until > now)
-            })
-    }
-
-    /// Return whether this peer still has a live backoff for `hash` under any authority.
-    ///
-    /// Production lookups are authority-keyed. A concurrent rekey moves the deadline
-    /// from one authority to another, so two successive
-    /// [`is_body_retry_avoided`](Self::is_body_retry_avoided) calls can both miss
-    /// even when the deadline never left the maps.
-    #[cfg(test)]
-    fn has_live_body_retry_deadline(
-        &self,
-        peer: &ZakuraPeerId,
-        hash: block::Hash,
-        now: Instant,
-    ) -> bool {
-        let source = zakura_header_chain::SourceId::from_digest(peer.digest());
-        let mut all_retries = self.body_retry_all_lock();
         all_retries.retain(|_, until| *until > now);
-        if all_retries.keys().any(|key| key.hash == hash) {
-            return true;
-        }
-        let mut retries = self.body_retry_lock();
         retries.entries.retain(|_, until| *until > now);
-        retries
-            .entries
-            .keys()
-            .any(|(candidate, key, _)| *candidate == source && key.hash == hash)
+        let current = retries
+            .current
+            .filter(|current| current.body_work_epoch == scope.body_work_epoch)
+            .unwrap_or(scope);
+        let key = BodyRetryKey::new(current, hash);
+        // The reactor may publish the durable alarm before the sequencer refreshes
+        // this registry. Either same-epoch authority still suppresses this body.
+        all_retries.contains_key(&BodyRetryKey::new(scope, hash))
+            || all_retries.contains_key(&key)
+            || [BodyRetryReason::Unavailable, BodyRetryReason::Incompatible]
+                .into_iter()
+                .any(|reason| retries.entries.contains_key(&(source, key, reason)))
     }
 
     pub(super) fn next_body_retry_deadline(
@@ -1243,15 +1217,18 @@ mod floor_bias_tests {
         let until = now + Duration::from_secs(60);
         for refresh_first in [false, true] {
             let registry = PeerRegistry::new();
+            registry.refresh_body_retry_scope(old);
             if refresh_first {
                 registry.refresh_body_retry_scope(refreshed);
             }
             registry.defer_incompatible_bodies(source, [(old, hash)], until);
             if !refresh_first {
+                // The work queue refreshes before the sequencer updates this registry.
+                assert!(registry.is_body_retry_avoided(&peer, refreshed, hash, now));
                 registry.refresh_body_retry_scope(refreshed);
             }
             assert!(registry.is_body_retry_avoided(&peer, refreshed, hash, now));
-            assert!(!registry.is_body_retry_avoided(&peer, old, hash, now));
+            assert!(registry.is_body_retry_avoided(&peer, old, hash, now));
             let reset = zakura_header_chain::BodyWorkAuthority {
                 body_work_epoch: zakura_header_chain::BodyWorkEpoch::new(99),
                 ..refreshed
@@ -1315,8 +1292,8 @@ mod floor_bias_tests {
             "a compatible refresh must carry every deadline to the new authority"
         );
         assert!(
-            !reg.is_body_retry_avoided(&peer, scope, hash, now),
-            "the pre-refresh authority no longer keys a live deadline"
+            reg.is_body_retry_avoided(&peer, scope, hash, now),
+            "a pre-refresh work snapshot must still observe the cooldown"
         );
         assert_eq!(reg.next_body_retry_deadline(&peer, now), Some(until));
 
@@ -1325,11 +1302,10 @@ mod floor_bias_tests {
         // the reader observes the complete map at one authority and never a
         // window in which the deadline has vanished. Each map carries the
         // deadline alone in its own phase, so neither can mask a gap in the other.
-        // The reader snapshots by hash rather than calling `is_body_retry_avoided`
-        // twice: production lookups are authority-keyed, and two successive calls
-        // can both miss while the deadline moves from one authority to the other.
+        // Exercise production lookups with work snapshots on either side of a refresh.
         for phase in ["per supplier", "all suppliers"] {
             reg.clear_body_retry(refreshed, hash);
+            reg.refresh_body_retry_scope(scope);
             if phase == "per supplier" {
                 reg.defer_body_retry(
                     [zakura_header_chain::SourceId::from_digest(peer.digest())],
@@ -1350,7 +1326,8 @@ mod floor_bias_tests {
                 move || {
                     while !stop.load(std::sync::atomic::Ordering::Relaxed) {
                         assert!(
-                            reg.has_live_body_retry_deadline(&peer, hash, now),
+                            reg.is_body_retry_avoided(&peer, scope, hash, now)
+                                && reg.is_body_retry_avoided(&peer, refreshed, hash, now),
                             "a concurrent rekey must never expose an unsuppressed body \
                              through the {phase} map"
                         );
