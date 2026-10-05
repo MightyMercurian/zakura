@@ -141,6 +141,21 @@ range ownership and completion futures, including small fixed session costs. The
 completion-receiver vector is allocated before measurement. Response channels remain lazy.
 These are allocator-requested bytes, excluding allocator overhead and allocations on other threads.
 
+On October 5, the `compact_waiting_containers` probe retained 4,219,592 bytes for 64,000
+requests using the real untracked serving queue plus a range map with integer generations.
+That is about 66 bytes per entry and a 2.16 GB extrapolation across 512 sessions. This is a
+container measurement, not an implemented completion tracker or a process-memory bound.
+It excludes the synchronization and ownership needed to remove completed ranges safely across
+out-of-order completion, cancellation, and replacement. Those contracts need implementation and
+regression coverage before using this figure to select defaults. No capacity default changed.
+
+The advertisement covers requests outstanding until their endings arrive at the requester.
+The server releases a commitment when it queues the ending, while output grants remain charged
+through the transport write. Long round trips can therefore require a large advertisement even
+with few active storage jobs. Size it from measured storage latency, RTT, response bytes, and
+transport buffering, then check adversarial waiting entries at twice that advertisement against
+the node budget. Execution concurrency alone does not determine this limit.
+
 Requester reservations have a separate cost. The probe includes the authorization maps, writer
 fences, and their retained copies of expected hashes, but excludes scheduler and decoded-block
 state. Its input hash vector is allocated before measurement.
@@ -152,9 +167,9 @@ state. Its input hash vector is allocated before measurement.
 | 32,768 | 1 | 13,268,828 |
 | 32,768 | 128 | 146,437,980 |
 
-Run the ignored `serving_capacity_candidates`, `waiting_commitment_allocation_breakdown`, and
-`requester_reservation_allocations` tests with `ZAKURA_CAPACITY_PROBE=1` and the `zakura-testkit`
-feature to reproduce this evidence. The candidate runs completed 24,128–36,903 unavailable
+Run the ignored `serving_capacity_candidates`, `waiting_commitment_allocation_breakdown`,
+`requester_reservation_allocations`, and `compact_waiting_containers` tests with
+`ZAKURA_CAPACITY_PROBE=1` and the `zakura-testkit` feature to reproduce this evidence. The candidate runs completed 24,128–36,903 unavailable
 responses per second, 29,353–36,029 single-small-block responses per second, and 435–441 configured
 128-block responses per second. The latter workload explicitly raises the default one-block
 response limit. The probe checks the number of bodies served. These fixtures use an in-process
@@ -189,8 +204,8 @@ still exercise the old serving path and do not establish regulated-path coverage
 
 Version 3 selects the entire regulated contract through its own capability. A real-QUIC test uses
 five old peers and one upgraded peer, downloads from an old peer without endings, forces an
-overlapping timeout retry, verifies endings for both overlapping old requests, completes a
-concurrent v3 serving exchange, and checks Status after replacement. Separate tests preserve v2
+overlapping timeout retry, serves actual bodies to every old peer, completes a v3 serving
+exchange before the old supplier finishes, and checks prompt Status corrections and replacement. Separate tests preserve v2
 replacement admission at its direction cap and its one-second range-correction allowance.
 Unexpected header hashes retire locally and retain authorization until cleanup. A short supplier
 cooldown survives reconnect without replacing the sequencer's retry episode. Buffered endings
