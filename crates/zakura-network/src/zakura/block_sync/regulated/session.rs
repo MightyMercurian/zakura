@@ -1,9 +1,6 @@
 //! Per-session serving admission with exact live-range overlap checks.
 
-use std::{collections::BTreeMap, future::Future, pin::Pin, sync::Arc};
-
-use futures::{stream::FuturesUnordered, FutureExt, StreamExt};
-use tokio::sync::watch;
+use std::{collections::BTreeMap, sync::Arc};
 use tokio_util::sync::CancellationToken;
 use zakura_chain::block::Height;
 
@@ -13,7 +10,7 @@ use super::{
 };
 use crate::zakura::{
     block_sync::{ZakuraBlockSyncConfig, MAX_BS_BLOCKS_PER_REQUEST, MAX_BS_RESPONSE_BYTES},
-    regulation::{sizing, Serve, ServeCapacity},
+    regulation::{sizing, CompletionId, Completions, Serve, ServeCapacity},
     FramedSend, SinkReject, ZakuraPeerId,
 };
 
@@ -71,17 +68,15 @@ impl Serving {
                 close_cause,
             ),
             ranges: BTreeMap::new(),
-            completed: FuturesUnordered::new(),
+            completed: Completions::default(),
         }
     }
 }
 
-type RangeCompletion = Pin<Box<dyn Future<Output = (Height, watch::Receiver<bool>)> + Send + Sync>>;
-
 pub(crate) struct ServingSession {
     serve: Serve<Server<dyn Source>>,
-    ranges: BTreeMap<Height, (Height, watch::Receiver<bool>)>,
-    completed: FuturesUnordered<RangeCompletion>,
+    ranges: BTreeMap<Height, (Height, CompletionId)>,
+    completed: Completions,
 }
 
 impl ServingSession {
@@ -89,44 +84,43 @@ impl ServingSession {
     /// overlapping, or excessive commitments are peer faults.
     pub(crate) fn admit(&mut self, start: Height, count: u32) -> Result<(), SinkReject> {
         let range = Range::new(start, count).map_err(SinkReject::protocol)?;
-        // Each completion is removed once. No full scan of live ranges is needed.
-        while let Some(Some((start, completed))) = self.completed.next().now_or_never() {
+        self.remove_completed();
+        let last = Height(start.0 + count - 1);
+        if self
+            .ranges
+            .range(..=last)
+            .next_back()
+            .is_some_and(|(_, (end, _))| *end >= start)
+        {
+            return Err(SinkReject::protocol(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "GetBlocks overlaps a live range",
+            )));
+        }
+        let completed = self.completed.track(u64::from(start.0));
+        let id = completed.id();
+        self.serve
+            .admit_tracked(range, completed)
+            .map_err(SinkReject::protocol)?;
+        self.ranges.insert(start, (last, id));
+        Ok(())
+    }
+
+    /// Drain under the ending-publication lock before reusing any live range.
+    fn remove_completed(&mut self) {
+        self.completed.drain(|id| {
+            let start =
+                Height(u32::try_from(id.key()).expect("GetBlocks completion keys are heights"));
             if self
                 .ranges
                 .get(&start)
-                .is_some_and(|(_, current)| current.same_channel(&completed))
+                .is_some_and(|(_, current)| *current == id)
             {
                 self.ranges.remove(&start);
             }
-        }
-        let last = Height(start.0 + count - 1);
-        while let Some((&previous, (previous_last, completed))) =
-            self.ranges.range(..=last).next_back()
-        {
-            // The watch read synchronizes with publication of the ending. A peer
-            // may already have received it before the completion future is polled.
-            if *completed.borrow() {
-                self.ranges.remove(&previous);
-                continue;
-            }
-            if *previous_last >= start {
-                return Err(SinkReject::protocol(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "GetBlocks overlaps a live range",
-                )));
-            }
-            break;
-        }
-        let completed = self
-            .serve
-            .admit_tracked(range)
-            .map_err(SinkReject::protocol)?;
-        self.ranges.insert(start, (last, completed.clone()));
-        self.completed.push(Box::pin(async move {
-            let mut completed = completed;
-            let _ = completed.wait_for(|done| *done).await;
-            (start, completed)
-        }));
-        Ok(())
+        });
     }
 }
+
+#[cfg(test)]
+mod tests;

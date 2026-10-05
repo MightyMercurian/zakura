@@ -110,44 +110,55 @@ correspondence, and completion status.
 
 ## Activation measurements
 
-On October 4, 2026, the debug build on an ARM64 Mac retained about 44.1 MB for
-64,000 waiting GetBlocks commitments in one session after response channels became lazy.
-The maximum-session probe retained 22,567,691,400 allocator-requested bytes for 512 sessions
-with 64,000 commitments each. Admission took 314.8 seconds. Both probes hold requests before
-workers start. They include request bookkeeping, not storage results, QUIC buffers, or process RSS.
-The per-request regression ceiling is 1,024 retained bytes, not a memory target.
+On October 4, 2026, the ARM64 Mac debug build retained about 44.1 MB for
+64,000 waiting GetBlocks commitments in one session. The maximum-session probe retained
+22,567,691,400 allocator-requested bytes for 512 sessions. That implementation kept a watch
+channel and a completion future for each range.
 
-The full probe is ignored and additionally requires `ZAKURA_LARGE_LOAD_TEST=1`, because CI also
-runs ignored tests and this probe needs tens of GB. Run the
-`maximum_admitted_getblocks_sessions_have_a_measured_memory_ceiling` test with that variable,
-the `zakura-testkit` feature, and `--ignored --nocapture` on a dedicated large host.
+On October 5, production switched to one completion queue per session, with unique admission
+identities and a weak completion lease per job. Publication and completion draining share a lock.
+Records are reserved on admission, so completion does not allocate on an encoding worker.
+Cancellation and a late producer drop cannot release a replacement admission. The GetBlocks
+range index drains completed identities before testing overlap, without per-range futures.
 
-After the serving-task supervision fixes, the smaller candidate probe measured waiting
-commitments at twice each advertised limit on the same host and debug build:
+The real `Serving::session` admission path now measures the following on the same host and build.
+Workers do not run during these synchronous allocation probes. Each session retains 10,332 bytes
+of fixed bookkeeping before admission; the table lists additional waiting-request bytes.
 
-| Advertised requests per peer | Waiting commitments | Retained bookkeeping bytes |
+| Advertised requests per peer | Waiting commitments | Additional retained bytes |
 | --- | --- | --- |
-| 32 | 64 | 52,668 |
-| 128 | 256 | 184,924 |
-| 512 | 1,024 | 714,172 |
-| 1,500 | 3,000 | 2,074,140 |
-| 32,000 | 64,000 | 44,079,772 |
+| 32 | 64 | 5,696 |
+| 128 | 256 | 27,360 |
+| 512 | 1,024 | 114,240 |
+| 1,500 | 3,000 | 353,696 |
+| 32,000 | 64,000 | 7,230,240 |
 
-The incremental allocation probe isolates the shared job queue and its completion tracking.
-With 64,000 queued requests, the shared queue retained 1,599,200 bytes without completion tracking
-and 23,615,200 bytes with it. The latter adds exactly 344 bytes per request for the watch channel.
-The complete GetBlocks session retained 44,079,772 bytes, adding about 320 bytes per request for
-range ownership and completion futures, including small fixed session costs. The standalone
-completion-receiver vector is allocated before measurement. Response channels remain lazy.
-These are allocator-requested bytes, excluding allocator overhead and allocations on other threads.
+At the default limit this is about 113 bytes per request plus the fixed session cost, an 84%
+reduction from the previous session measurement. Extrapolating the combined 7,240,572 bytes to
+512 sessions gives 3,707,172,864 bytes, about 3.7 GB. This is bookkeeping, not a total node bound:
+storage results, output and QUIC buffers, allocator overhead, requester state, and overlapping
+session cleanup need separate allowance. The regression ceilings are 16 KiB per session plus
+160 bytes per waiting request. They detect growth; they do not establish an acceptable budget.
 
-On October 5, the `compact_waiting_containers` probe retained 4,219,592 bytes for 64,000
-requests using the real untracked serving queue plus a range map with integer generations.
-That is about 66 bytes per entry and a 2.16 GB extrapolation across 512 sessions. This is a
-container measurement, not an implemented completion tracker or a process-memory bound.
-It excludes the synchronization and ownership needed to remove completed ranges safely across
-out-of-order completion, cancellation, and replacement. Those contracts need implementation and
-regression coverage before using this figure to select defaults. No capacity default changed.
+The shared queue alone retains 2,622,688 bytes for 64,000 untracked requests and 3,671,328 bytes
+with completion tracking. The complete GetBlocks range index and queue account for the table's
+7,230,240 additional bytes. These are allocator-requested bytes. The earlier 66-byte candidate
+container excluded lifecycle handling and has been replaced by these production-path probes.
+
+A separate production-session workload queues 64,000 requests, completes and refills 512, cancels
+the session, then queues a full replacement before the old dispatch cleans up. It verifies cleanup
+returns execution capacity. On this host its test process peaked at 32,948,224 bytes RSS under
+`/usr/bin/time -l`. The two-request cancellation regression process peaked at 21,725,184 bytes.
+These whole-process peaks include the test runtime and loaded code. They are not additive per-peer
+costs or measurements of a production node. This workload uses empty storage results and an
+in-memory framed transport, so it does not establish live-storage or QUIC buffer peaks.
+
+Run `compact_session_lifecycle_peak` from the compiled test binary with `--exact --ignored
+--nocapture`, `ZAKURA_CAPACITY_PROBE=1`, and an external process peak-memory sampler. Do not use
+the thread-local allocation helper across this async workload: encoding workers move ownership
+between threads, which that helper cannot account for. The ignored maximum-session probe still
+requires `ZAKURA_LARGE_LOAD_TEST=1` and a dedicated host because it retains several GB. No advertised
+capacity default changed.
 
 The advertisement covers requests outstanding until their endings arrive at the requester.
 The server releases a commitment when it queues the ending, while output grants remain charged
@@ -168,9 +179,9 @@ state. Its input hash vector is allocated before measurement.
 | 32,768 | 128 | 146,437,980 |
 
 Run the ignored `serving_capacity_candidates`, `waiting_commitment_allocation_breakdown`,
-`requester_reservation_allocations`, and `compact_waiting_containers` tests with
-`ZAKURA_CAPACITY_PROBE=1` and the `zakura-testkit` feature to reproduce this evidence. The candidate runs completed 24,128–36,903 unavailable
-responses per second, 29,353–36,029 single-small-block responses per second, and 435–441 configured
+and `requester_reservation_allocations` tests with
+`ZAKURA_CAPACITY_PROBE=1` and the `zakura-testkit` feature to reproduce this evidence. The candidate runs completed 31,804–42,944 unavailable
+responses per second, 30,092–36,487 single-small-block responses per second, and 421–436 configured
 128-block responses per second. The latter workload explicitly raises the default one-block
 response limit. The probe checks the number of bodies served. These fixtures use an in-process
 queue and synthetic storage, without QUIC backpressure or an injected network RTT.
@@ -190,8 +201,8 @@ before overhead. A lower request count alone cannot establish the target.
 
 Keep activation in draft until representative production-storage and QUIC measurements justify
 the capacity default and reconcile the throughput target with response batching and the transport
-window. Evaluate compact completion tracking, range batching above the download floor, and
-budgeted per-session advertisements together. Any dynamic advertisement must retain capacity for
+window. Use the production completion measurements when evaluating range batching above the download
+floor and budgeted per-session advertisements. Any dynamic advertisement must retain capacity for
 its highest outstanding promise. Lowering a Status value does not release old commitments.
 Measure fixed costs and allocator variation before selecting a memory target, and include the
 requester pool separately. Do not silently change those policies or size request counts and

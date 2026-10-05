@@ -97,7 +97,8 @@ fn capacity(body_bytes: u32) -> ServeCapacity {
     .unwrap()
 }
 
-async fn receive(recv: &mut crate::zakura::FramedRecv) -> Message {
+/// Decode the next production response with a bounded wait.
+pub(super) async fn receive(recv: &mut crate::zakura::FramedRecv) -> Message {
     let frame = tokio::time::timeout(Duration::from_secs(5), recv.recv())
         .await
         .unwrap()
@@ -740,29 +741,37 @@ fn measure_waiting_getblocks_capacity(peers: usize, config: &super::super::Zakur
     let started = std::time::Instant::now();
     // No await: all requests remain queued before any worker can run. Output
     // receivers stay alive so closed queues cannot hide the retained cost.
-    let (sessions, allocations) = zakura_test::allocations::measure(|| {
+    let (mut sessions, fixed) = zakura_test::allocations::measure(|| {
         (0..peers)
             .map(|index| {
                 let mut identity = vec![91; 32];
                 identity[..8].copy_from_slice(&u64::try_from(index).unwrap().to_le_bytes());
                 let peer = ZakuraPeerId::new(identity).unwrap();
                 let (send, output) = framed_channel(4);
-                let mut session = serving.session(
+                let session = serving.session(
                     &peer,
                     send,
                     cancel.clone(),
                     cancel.clone(),
                     crate::zakura::CloseCause::default(),
                 );
-                for height in 1..=count {
-                    session.admit(block::Height(height), 1).unwrap();
-                }
                 (session, output)
             })
             .collect::<Vec<_>>()
     });
+    let (_, allocations) = zakura_test::allocations::measure(|| {
+        for (session, _) in &mut sessions {
+            for height in 1..=count {
+                session.admit(block::Height(height), 1).unwrap();
+            }
+        }
+    });
+    eprintln!("GetBlocks fixed peers={peers} {fixed:?}");
+    // ARM64 debug measurements were about 10 KiB fixed plus 113 B per queued request.
+    // These ceilings catch bookkeeping regressions, not total node-memory use.
+    assert!(fixed.retained_bytes < peers * 16_384, "{fixed:?}");
     assert!(
-        allocations.retained_bytes < peers * usize::try_from(count).unwrap() * 1_024,
+        allocations.retained_bytes < peers * usize::try_from(count).unwrap() * 160,
         "{allocations:?}"
     );
     eprintln!(
