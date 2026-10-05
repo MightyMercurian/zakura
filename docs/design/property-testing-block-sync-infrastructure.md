@@ -122,22 +122,50 @@ runs ignored tests and this probe needs tens of GB. Run the
 `maximum_admitted_getblocks_sessions_have_a_measured_memory_ceiling` test with that variable,
 the `zakura-testkit` feature, and `--ignored --nocapture` on a dedicated large host.
 
-The smaller candidate probe measured waiting commitments at twice each advertised limit:
+After the serving-task supervision fixes, the smaller candidate probe measured waiting
+commitments at twice each advertised limit on the same host and debug build:
 
 | Advertised requests per peer | Waiting commitments | Retained bookkeeping bytes |
 | --- | --- | --- |
-| 32 | 64 | 50,684 |
-| 128 | 256 | 182,940 |
-| 512 | 1,024 | 712,188 |
-| 32,000 | 64,000 | 44,077,788 |
+| 32 | 64 | 52,668 |
+| 128 | 256 | 184,924 |
+| 512 | 1,024 | 714,172 |
+| 1,500 | 3,000 | 2,074,140 |
+| 32,000 | 64,000 | 44,079,772 |
 
-Run `serving_capacity_candidates` with `ZAKURA_CAPACITY_PROBE=1`, the `zakura-testkit` feature,
-and ignored tests enabled to reproduce the table and the fixture throughput probe. On the same
-host and debug build, the candidates completed 24,411–42,942 unavailable responses per second,
-29,979–37,132 single-small-block responses per second, and 434–437 configured 128-block responses
-per second. The latter workload explicitly raises the default one-block response limit. The
-probe checks the number of bodies served. It uses synthetic storage and an in-process queue,
-so these are CPU/queue observations without disk cost, QUIC backpressure, or an injected RTT.
+The incremental allocation probe isolates the shared job queue and its completion tracking.
+With 64,000 queued requests, the shared queue retained 1,599,200 bytes without completion tracking
+and 23,615,200 bytes with it. The latter adds exactly 344 bytes per request for the watch channel.
+The complete GetBlocks session retained 44,079,772 bytes, adding about 320 bytes per request for
+range ownership and completion futures, including small fixed session costs. The standalone
+completion-receiver vector is allocated before measurement. Response channels remain lazy.
+These are allocator-requested bytes, excluding allocator overhead and allocations on other threads.
+
+Requester reservations have a separate cost. The probe includes the authorization maps, writer
+fences, and their retained copies of expected hashes, but excludes scheduler and decoded-block
+state. Its input hash vector is allocated before measurement.
+
+| Reservation entries | Expected hashes per entry | Retained bookkeeping bytes |
+| --- | --- | --- |
+| 16,384 | 1 | 6,632,988 |
+| 16,384 | 128 | 73,217,564 |
+| 32,768 | 1 | 13,268,828 |
+| 32,768 | 128 | 146,437,980 |
+
+Run the ignored `serving_capacity_candidates`, `waiting_commitment_allocation_breakdown`, and
+`requester_reservation_allocations` tests with `ZAKURA_CAPACITY_PROBE=1` and the `zakura-testkit`
+feature to reproduce this evidence. The candidate runs completed 24,128–36,903 unavailable
+responses per second, 29,353–36,029 single-small-block responses per second, and 435–441 configured
+128-block responses per second. The latter workload explicitly raises the default one-block
+response limit. The probe checks the number of bodies served. These fixtures use an in-process
+queue and synthetic storage, without QUIC backpressure or an injected network RTT.
+
+Adding a simulated 500 ms storage delay to each single-block response reduced every candidate
+to 36.2–36.3 responses per second, about 0.48 Mbps for these small blocks. The current per-peer
+execution limit is 19, derived using the largest response rather than the actual response size.
+Nineteen concurrent reads at that latency permit at most 38 responses per second. Increasing the
+advertisement from 32 to 32,000 therefore did not improve this workload. This is a controlled
+latency experiment, not a measurement of production storage latency.
 
 These measurements do not validate the 32,000 advertised default. A single small-block response
 in this fixture averages about 1,644 wire bytes. At that size, the design's twice-bandwidth-delay
@@ -147,8 +175,12 @@ before overhead. A lower request count alone cannot establish the target.
 
 Keep activation in draft until representative production-storage and QUIC measurements justify
 the capacity default and reconcile the throughput target with response batching and the transport
-window. Do not silently change those policies or size request counts using the maximum response
-alone when the default serves one block.
+window. Evaluate compact completion tracking, range batching above the download floor, and
+budgeted per-session advertisements together. Any dynamic advertisement must retain capacity for
+its highest outstanding promise. Lowering a Status value does not release old commitments.
+Measure fixed costs and allocator variation before selecting a memory target, and include the
+requester pool separately. Do not silently change those policies or size request counts and
+execution slots using the maximum response alone when the default serves one block.
 
 The stream-6 conformance adapter exercises the production layout over QUIC, including simultaneous
 serving and exhausted credit. It uses the shared serving harness, so the production GetBlocks
@@ -157,7 +189,9 @@ still exercise the old serving path and do not establish regulated-path coverage
 
 Version 3 selects the entire regulated contract through its own capability. A real-QUIC test uses
 five old peers and one upgraded peer, downloads from an old peer without endings, forces an
-overlapping timeout retry, accepts overlapping old requests, and checks Status after replacement.
+overlapping timeout retry, verifies endings for both overlapping old requests, completes a
+concurrent v3 serving exchange, and checks Status after replacement. Separate tests preserve v2
+replacement admission at its direction cap and its one-second range-correction allowance.
 Unexpected header hashes retire locally and retain authorization until cleanup. A short supplier
 cooldown survives reconnect without replacing the sequencer's retry episode. Buffered endings
 survive local read pauses, while actively withheld endings still retire the connection.
