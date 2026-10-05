@@ -689,9 +689,15 @@ async fn a_live_partially_returned_range_waits_without_retry_spin() {
             .retirement_deadline(routine.config.effective_liveness_timeout()),
         None
     );
+    // Keep the connection eligible for another request. Without prior progress,
+    // the initial probe limit masks the retry loop before it touches the queue.
+    routine.window.note_block_progress(
+        time::Instant::now().into_std(),
+        routine.config.effective_liveness_timeout(),
+    );
     assert_eq!(routine.try_fill().await, None);
     assert!(routine.work.pending_contains(block::Height(1)));
-    let before = routine.next_request_id.unwrap().get();
+    let before = routine.work.taken_items_for_test();
     let (_input, recv) = crate::zakura::framed_channel(4);
     routine.recv = recv;
     let (_view, view_rx) = watch::channel(*routine.sequencer_view.borrow());
@@ -705,7 +711,7 @@ async fn a_live_partially_returned_range_waits_without_retry_spin() {
         time::advance(Duration::from_millis(1)).await;
     }
     drop(running);
-    assert!(routine.next_request_id.unwrap().get() - before <= 2);
+    assert!(routine.work.taken_items_for_test() - before <= 2);
     assert_eq!(routine.window.outstanding.len(), 1);
     assert!(!connection.is_cancelled());
 }
