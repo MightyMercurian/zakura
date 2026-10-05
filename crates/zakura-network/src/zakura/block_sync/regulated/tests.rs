@@ -462,6 +462,30 @@ async fn next_response(output: &mut crate::zakura::FramedRecv) -> Message {
     }
 }
 
+/// An encoder panic must reach the production connection token, with no download fence involved.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn live_serving_encoder_panic_closes_the_connection_without_downloads() {
+    let mut source = store(&[&BLOCK_MAINNET_1_BYTES], true);
+    let block = Arc::make_mut(&mut Arc::get_mut(&mut source).unwrap().blocks[0].1);
+    // Exercise the serializer's timestamp invariant in the real blocking encode job.
+    Arc::make_mut(&mut block.header).time = chrono::DateTime::from_timestamp(-1, 0).unwrap();
+    let live = live_serving(source, super::super::MAX_BS_RESPONSE_BYTES);
+    live.input
+        .send(
+            BlockSyncMessage::GetBlocks {
+                start_height: block::Height(1),
+                count: 1,
+            }
+            .encode_frame()
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), live.cancel.cancelled())
+        .await
+        .unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn live_routine_serves_bounded_prefixes_and_allows_reuse_after_each_ending() {
     let source = store(&[&BLOCK_MAINNET_1_BYTES, &BLOCK_MAINNET_2_BYTES], true);

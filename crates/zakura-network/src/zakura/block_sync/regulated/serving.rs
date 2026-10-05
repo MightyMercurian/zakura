@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use zakura_chain::{block, serialization::ZcashSerialize};
+use zakura_chain::{block, diagnostic::task::CheckForPanics, serialization::ZcashSerialize};
 
 use super::wire::{Message, Range};
 use crate::zakura::{
@@ -99,7 +99,8 @@ impl<S: Source + ?Sized> Produce for Server<S> {
             encode_response(requested, read_range.count, max_body_bytes, result, sink)
         })
         .await
-        .map_err(|error| ServeEnd::LocalFault(error.to_string()))?
+        .check_for_panics_with(false)
+        .map_err(|_| ServeEnd::Cancelled)?
     }
 
     fn local_failure(&self, range: &Range, sent: SinkProgress) -> Message {
