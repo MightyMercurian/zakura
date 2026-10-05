@@ -1252,6 +1252,12 @@ mod regulated_frame_tests {
                 ZAKURA_BLOCK_SYNC_STREAM_VERSION,
                 false,
             ),
+            // The retired header-sync bit must not select regulated block sync.
+            (
+                ZAKURA_CAP_BLOCK_SYNC | (1 << 4),
+                ZAKURA_BLOCK_SYNC_STREAM_VERSION,
+                false,
+            ),
             (
                 ZAKURA_CAP_BLOCK_SYNC_REGULATED,
                 ZAKURA_REGULATED_BLOCK_SYNC_STREAM_VERSION,

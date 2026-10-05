@@ -8,7 +8,7 @@ pub const ZAKURA_CAP_BLOCK_SYNC: u64 = 1 << 3;
 pub const ZAKURA_BLOCK_SYNC_STREAM_VERSION: u16 = 2;
 
 /// Capability for the regulated height-range contract on stream version 3.
-pub const ZAKURA_CAP_BLOCK_SYNC_REGULATED: u64 = 1 << 4;
+pub const ZAKURA_CAP_BLOCK_SYNC_REGULATED: u64 = 1 << 8;
 /// Version selecting bounded commitments, exact responses, and frame/cadence rules.
 pub const ZAKURA_REGULATED_BLOCK_SYNC_STREAM_VERSION: u16 = 3;
 

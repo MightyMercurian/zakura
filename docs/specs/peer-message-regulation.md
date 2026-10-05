@@ -623,7 +623,7 @@ a peer violation.
 
 ### Block sync — stream 6, regulated version 3
 
-The regulated contract uses capability bit 4 and stream version 3. It retains version 2's
+The regulated contract uses capability bit 8 and stream version 3. It retains version 2's
 five messages and byte encodings. Version 3 changes admission and lifetime rules, not request
 identity. Peers MUST negotiate version 3 before applying the following regulation rules.
 Negotiation MUST select the complete behavior together: the frame table and cadence, serving
