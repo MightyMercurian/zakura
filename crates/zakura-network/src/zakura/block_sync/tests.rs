@@ -667,6 +667,39 @@ fn state_is_only_frontier_publisher() {
     );
 }
 
+/// Production startup seeds cooldown authority before any routine or sequencer can run.
+#[tokio::test]
+async fn startup_body_cooldown_survives_the_first_work_refresh() {
+    let header = zakura_header_chain::Frontier::new(block::Height(10), block::Hash([0x52; 32]));
+    let mut snapshot = alarmed_committed_snapshot(header);
+    snapshot.alarms.header_best_body_unavailable = None;
+    let view = committed_view(snapshot, 0);
+    let scope = zakura_header_chain::BodyWorkAuthority::for_view(&view);
+    let (_snapshots, receiver) = watch::channel(Some(view));
+    let mut startup = BlockSyncStartup::inert(ZakuraBlockSyncConfig::default());
+    startup.committed_views = Some(receiver);
+    let (handle, _actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let registry = &handle.routine_wiring.as_ref().unwrap().registry;
+    let supplier = peer(0x54);
+    let now = Instant::now();
+    registry.defer_incompatible_bodies(
+        zakura_header_chain::SourceId::from_digest(supplier.digest()),
+        [(scope, header.hash)],
+        now + Duration::from_secs(60),
+    );
+    let refreshed = zakura_header_chain::BodyWorkAuthority {
+        header: zakura_header_chain::HeaderWorkAuthority {
+            header_generation: scope.header_generation.checked_next().unwrap(),
+            ..scope.header
+        },
+        ..scope
+    };
+    // No await: the spawned sequencer cannot initialize the registry for this test.
+    assert!(registry.is_body_retry_avoided(&supplier, refreshed, header.hash, now));
+    assert!(!registry.is_body_retry_avoided(&peer(0x55), refreshed, header.hash, now));
+    reactor_task.abort();
+}
+
 #[tokio::test]
 async fn operator_body_retry_is_exact_deduplicated_and_requires_a_supplier() {
     let header = zakura_header_chain::Frontier::new(block::Height(10), block::Hash([0x52; 32]));
