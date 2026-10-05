@@ -375,13 +375,11 @@ impl PeerRegistry {
         });
     }
 
-    /// Rekey every retained suppression deadline to the latest compatible authority.
+    /// Carry suppression deadlines through a compatible authority refresh.
     ///
-    /// Both maps are rekeyed under guards that this method holds across the complete
-    /// rewrite, so a concurrent routine never observes an emptied or half-rekeyed map and
-    /// never re-requests a body that is still inside its backoff. The guards are acquired
-    /// in the all-suppliers then per-supplier order that
-    /// [`is_body_retry_avoided`](Self::is_body_retry_avoided) uses.
+    /// Hold both maps in lookup lock order so readers cannot observe a partial rewrite.
+    /// Lookups check both their caller snapshot and the registry's current authority
+    /// while the work queue and sequencer catch up with each other.
     pub(super) fn refresh_body_retry_scope(&self, current: zakura_header_chain::BodyWorkAuthority) {
         let mut all_retries = self.body_retry_all_lock();
         let mut retries = self.body_retry_lock();
@@ -426,14 +424,18 @@ impl PeerRegistry {
             .current
             .filter(|current| current.body_work_epoch == scope.body_work_epoch)
             .unwrap_or(scope);
-        let key = BodyRetryKey::new(current, hash);
-        // The reactor may publish the durable alarm before the sequencer refreshes
-        // this registry. Either same-epoch authority still suppresses this body.
-        all_retries.contains_key(&BodyRetryKey::new(scope, hash))
-            || all_retries.contains_key(&key)
-            || [BodyRetryReason::Unavailable, BodyRetryReason::Incompatible]
-                .into_iter()
-                .any(|reason| retries.entries.contains_key(&(source, key, reason)))
+        let keys = [
+            BodyRetryKey::new(current, hash),
+            BodyRetryKey::new(scope, hash),
+        ];
+        // Alarm publication and supplier deferral can precede the registry refresh.
+        // Check both snapshots without crossing a body-work epoch.
+        keys.into_iter().any(|key| {
+            all_retries.contains_key(&key)
+                || [BodyRetryReason::Unavailable, BodyRetryReason::Incompatible]
+                    .into_iter()
+                    .any(|reason| retries.entries.contains_key(&(source, key, reason)))
+        })
     }
 
     pub(super) fn next_body_retry_deadline(
@@ -1265,6 +1267,55 @@ mod floor_bias_tests {
             registry.defer_incompatible_bodies(source, [(old, hash)], until);
             assert!(!registry.is_body_retry_avoided(&peer, reset, hash, now));
             assert!(!registry.is_body_retry_avoided(&peer, old, hash, now));
+        }
+    }
+
+    /// Caller and registry snapshots both find supplier deadlines during compatible refreshes.
+    #[test]
+    fn supplier_cooldown_lookup_checks_both_refresh_scopes() {
+        let old = super::super::test_work_scope();
+        let refreshed = zakura_header_chain::BodyWorkAuthority {
+            header: zakura_header_chain::HeaderWorkAuthority {
+                header_generation: old.header_generation.checked_next().unwrap(),
+                ..old.header
+            },
+            ..old
+        };
+        let supplier = peer(1);
+        let source = zakura_header_chain::SourceId::from_digest(supplier.digest());
+        let hash = block::Hash([8; 32]);
+        let now = Instant::now();
+        let until = now + Duration::from_secs(60);
+        for reason in [BodyRetryReason::Unavailable, BodyRetryReason::Incompatible] {
+            for (current, caller) in [(old, refreshed), (refreshed, old)] {
+                let registry = PeerRegistry::new();
+                registry.refresh_body_retry_scope(current);
+                match reason {
+                    BodyRetryReason::Unavailable => {
+                        registry.defer_body_retry([source], caller, hash, until);
+                    }
+                    BodyRetryReason::Incompatible => {
+                        registry.defer_incompatible_bodies(source, [(caller, hash)], until);
+                    }
+                }
+                assert!(registry.is_body_retry_avoided(&supplier, caller, hash, now));
+                assert!(!registry.is_body_retry_avoided(&peer(2), caller, hash, now));
+                assert!(!registry.is_body_retry_avoided(
+                    &supplier,
+                    caller,
+                    block::Hash([9; 32]),
+                    now
+                ));
+                let reset = zakura_header_chain::BodyWorkAuthority {
+                    body_work_epoch: caller.body_work_epoch.checked_next().unwrap(),
+                    ..caller
+                };
+                assert!(!registry.is_body_retry_avoided(&supplier, reset, hash, now));
+                registry.refresh_body_retry_scope(caller);
+                assert!(registry.is_body_retry_avoided(&supplier, current, hash, now));
+                registry.retain_body_retry_scope(Some(reset));
+                assert!(!registry.is_body_retry_avoided(&supplier, caller, hash, now));
+            }
         }
     }
 
