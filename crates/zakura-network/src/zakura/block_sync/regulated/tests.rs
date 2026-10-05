@@ -396,6 +396,7 @@ struct LiveServing {
     input: crate::zakura::FramedSend,
     output: crate::zakura::FramedRecv,
     cancel: CancellationToken,
+    session_cancel: CancellationToken,
 }
 
 impl Drop for LiveServing {
@@ -420,6 +421,7 @@ fn live_serving(source: Arc<Store>, max_bytes: u32) -> LiveServing {
     };
     let cancel = CancellationToken::new();
     let close_cause = crate::zakura::CloseCause::default();
+    let session_cancel = cancel.child_token();
     let mut startup =
         super::super::BlockSyncStartup::inert(config.clone()).with_range_source(source);
     startup.shutdown = cancel.clone();
@@ -446,7 +448,7 @@ fn live_serving(source: Arc<Store>, max_bytes: u32) -> LiveServing {
                 ZAKURA_REGULATED_BLOCK_SYNC_STREAM_VERSION,
                 recv,
                 send,
-                cancel.child_token(),
+                session_cancel.clone(),
             ),
         )]),
         cancel.clone(),
@@ -458,6 +460,7 @@ fn live_serving(source: Arc<Store>, max_bytes: u32) -> LiveServing {
         input,
         output,
         cancel,
+        session_cancel,
     }
 }
 
@@ -468,6 +471,51 @@ async fn next_response(output: &mut crate::zakura::FramedRecv) -> Message {
             return message;
         }
     }
+}
+
+/// Session cancellation stops serving and returns its sole slot without closing the connection.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn live_serving_session_cancellation_releases_the_slot_without_closing_the_connection() {
+    use crate::zakura::{Service, ServicePeerDirection};
+
+    let source = store(&[&BLOCK_MAINNET_1_BYTES], false);
+    let _release_on_drop = ReleaseOnDrop(source.release.clone());
+    let live = live_serving(source.clone(), super::super::MAX_BS_RESPONSE_BYTES);
+    // If serving uses the connection token by mistake, these responses fill the
+    // unread output and pin the writer after the routine's session has stopped.
+    for height in 1..=5 {
+        live.input
+            .send(
+                BlockSyncMessage::GetBlocks {
+                    start_height: block::Height(height),
+                    count: 1,
+                }
+                .encode_frame()
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+    }
+    tokio::time::timeout(Duration::from_secs(5), source.started.acquire_many(5))
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+    live.session_cancel.cancel();
+    assert!(!live.cancel.is_cancelled());
+    source.release.add_permits(5);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Ok(Some(slot)) = live.service.reserve_session(ServicePeerDirection::Outbound) {
+                drop(slot);
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("cancelled serving releases the sole session slot without reading output");
+    assert!(!live.cancel.is_cancelled());
 }
 
 /// An encoder panic must reach the production connection token, with no download fence involved.
