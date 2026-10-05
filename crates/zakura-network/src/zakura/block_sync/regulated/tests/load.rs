@@ -67,7 +67,7 @@ async fn serving_capacity_candidates() {
             let cancel = CancellationToken::new();
             let peer = ZakuraPeerId::new(vec![17; 32]).unwrap();
             let (send, mut output) = framed_channel(64);
-            let mut session = serving.session(&peer, send, cancel.clone());
+            let mut session = serving.session(&peer, send, cancel.clone(), cancel.clone());
             let (mut issued, mut completed, mut bodies, mut wire_bytes) =
                 (0_u32, 0_u32, 0_u32, 0_u64);
             let started = std::time::Instant::now();

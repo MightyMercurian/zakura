@@ -54,14 +54,20 @@ impl Serving {
         peer: &ZakuraPeerId,
         send: FramedSend,
         cancel: CancellationToken,
+        connection: CancellationToken,
     ) -> ServingSession {
         let producer = Server::new(self.source.clone(), self.max_blocks, self.max_body_bytes)
             .expect("advertised serving limits are within the protocol bounds")
             .with_session(send.clone());
         ServingSession {
-            serve: self
-                .capacity
-                .session(Arc::new(producer), peer, self.advertised, send, cancel),
+            serve: self.capacity.session(
+                Arc::new(producer),
+                peer,
+                self.advertised,
+                send,
+                cancel,
+                connection,
+            ),
             ranges: BTreeMap::new(),
             completed: FuturesUnordered::new(),
         }

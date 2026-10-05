@@ -896,6 +896,7 @@ impl Service for BlockSyncService {
                                         &peer_id,
                                         block_sync_session.request_sender(),
                                         run_cancel.clone(),
+                                        connection_cancel_token.clone(),
                                     )
                                 });
                         let requester = requester_fence.map(|fence| {

@@ -603,6 +603,7 @@ async fn a_timed_out_read_keeps_the_same_peer_budget_after_its_output_drains() {
         1,
         send,
         cancel.clone(),
+        cancel.clone(),
     );
     let range = Range::new(block::Height(1), 1).unwrap();
     serving.admit(range).unwrap();
@@ -664,7 +665,7 @@ fn measure_waiting_getblocks_capacity(peers: usize, config: &super::super::Zakur
                 identity[..8].copy_from_slice(&u64::try_from(index).unwrap().to_le_bytes());
                 let peer = ZakuraPeerId::new(identity).unwrap();
                 let (send, output) = framed_channel(4);
-                let mut session = serving.session(&peer, send, cancel.clone());
+                let mut session = serving.session(&peer, send, cancel.clone(), cancel.clone());
                 for height in 1..=count {
                     session.admit(block::Height(height), 1).unwrap();
                 }
