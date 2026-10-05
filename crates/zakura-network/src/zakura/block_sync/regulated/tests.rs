@@ -219,6 +219,7 @@ async fn body_limit_excludes_tags_and_ending_and_stops_at_a_prefix() {
         2,
         send,
         cancel.clone(),
+        cancel.clone(),
     );
     server
         .admit(Range::new(block::Height(1), 2).unwrap())
@@ -249,6 +250,7 @@ async fn too_small_body_budget_returns_original_unavailable_range() {
         2,
         send,
         cancel.clone(),
+        cancel.clone(),
     );
     let range = Range::new(block::Height(1), 128).unwrap();
     server.admit(range).unwrap();
@@ -270,6 +272,7 @@ async fn cancellation_keeps_storage_execution_until_the_actual_job_finishes() {
         1,
         send,
         cancel.clone(),
+        cancel.clone(),
     );
     let range = Range::new(block::Height(1), 1).unwrap();
     first.admit(range).unwrap();
@@ -287,6 +290,7 @@ async fn cancellation_keeps_storage_execution_until_the_actual_job_finishes() {
         &ZakuraPeerId::new(vec![4; 32]).unwrap(),
         1,
         send,
+        second_cancel.clone(),
         second_cancel.clone(),
     );
     second.admit(range).unwrap();
@@ -349,6 +353,7 @@ async fn a_storage_failure_ends_without_faulting_or_cancelling_the_session() {
         &ZakuraPeerId::new(vec![5; 32]).unwrap(),
         1,
         send,
+        cancel.clone(),
         cancel.clone(),
     );
     let range = Range::new(block::Height(1), 1).unwrap();
