@@ -206,7 +206,7 @@ impl Requester {
 
     /// A scheduler timeout changes local interest, never the peer's authority.
     pub(super) fn abandon(&mut self, start: Height) {
-        let now = Instant::now() - self.read_paused;
+        let now = tokio::time::Instant::now().into_std() - self.read_paused;
         self.reservations.abandon(&start);
         if let Some(pending) = self.ranges.get_mut(&start) {
             let at = *pending.retirement_started_at.get_or_insert(now);
@@ -228,7 +228,7 @@ impl Requester {
         hash: Hash,
         payload_len: usize,
     ) -> Result<(Height, Claimed), ResponseError> {
-        let now = Instant::now() - self.read_paused;
+        let now = tokio::time::Instant::now().into_std() - self.read_paused;
         let start = *self.next.get(&hash).ok_or(ResponseError::Identity)?;
         let pending = self
             .ranges

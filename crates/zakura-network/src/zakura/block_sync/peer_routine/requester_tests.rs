@@ -597,7 +597,6 @@ async fn buffered_ending_survives_a_long_local_decode_wait() {
         )
         .await
         .unwrap();
-    let before = Instant::now();
     let mut guard = block_sync_guard();
     let mut processing = Box::pin(
         routine.handle_frame(
@@ -613,7 +612,7 @@ async fn buffered_ending_survives_a_long_local_decode_wait() {
     processing.await.unwrap();
     received.try_recv().unwrap();
     assert!(routine
-        .check_request_liveness(before + Duration::from_secs(40))
+        .check_request_liveness(time::Instant::now().into_std())
         .is_ok());
     assert!(!connection.is_cancelled());
     routine
@@ -680,4 +679,58 @@ async fn a_disappeared_avoidance_timer_still_retries_immediately() {
     let now = Instant::now();
     assert_eq!(routine.retry_filter_wake_deadline(now, true), Some(now));
     assert_eq!(routine.retry_filter_wake_deadline(now, false), None);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_withheld_ending_retires_after_reading_resumes_from_a_local_pause() {
+    // Advance first so the test detects a mix of wall and paused Tokio clocks.
+    time::advance(Duration::from_secs(7)).await;
+    let block: block::Block = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
+        .zcash_deserialize_into()
+        .unwrap();
+    let (mut routine, mut outbound, pool, connection) = requester_routine(block.hash());
+    let (bodies, mut received) = mpsc::channel(1);
+    let held = bodies.clone().try_reserve_owned().unwrap();
+    routine.sequencer_input = bodies;
+    routine.try_fill().await;
+    outbound.recv().await.unwrap();
+    let mut guard = block_sync_guard();
+    let mut processing = Box::pin(
+        routine.handle_frame(
+            &mut guard,
+            BlockSyncMessage::Block(Arc::new(block))
+                .encode_frame()
+                .unwrap(),
+        ),
+    );
+    assert!(futures::poll!(&mut processing).is_pending());
+    time::advance(Duration::from_secs(40)).await;
+    drop(held);
+    processing.await.unwrap();
+    received.try_recv().unwrap();
+    let resumed = time::Instant::now().into_std();
+    let grace = routine.config.effective_liveness_timeout();
+    assert_eq!(
+        routine
+            .requester
+            .as_ref()
+            .unwrap()
+            .retirement_deadline(grace),
+        Some(resumed + grace)
+    );
+    assert!(routine.check_request_liveness(resumed).is_ok());
+    assert!(!connection.is_cancelled());
+    time::advance(grace - Duration::from_nanos(1)).await;
+    assert!(routine
+        .check_request_liveness(time::Instant::now().into_std())
+        .is_ok());
+    time::advance(Duration::from_nanos(1)).await;
+    assert!(matches!(
+        routine.check_request_liveness(time::Instant::now().into_std()),
+        Err(SinkReject::Local(_))
+    ));
+    assert!(connection.is_cancelled());
+    assert_eq!(pool.held(), 1);
+    drop(routine);
+    assert_eq!(pool.held(), 0);
 }
