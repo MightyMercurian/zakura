@@ -105,6 +105,10 @@ impl BlockSyncPeerSession {
         self.cancel_token.clone()
     }
 
+    pub(super) fn is_regulated(&self) -> bool {
+        self.status_sender.is_some()
+    }
+
     pub(super) fn request_sender(&self) -> FramedSend {
         self.send.clone()
     }

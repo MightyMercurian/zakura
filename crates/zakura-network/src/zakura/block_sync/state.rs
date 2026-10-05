@@ -898,11 +898,12 @@ impl PeerBlockState {
     pub(super) fn new(session: BlockSyncPeerSession, config: &ZakuraBlockSyncConfig) -> Self {
         Self {
             direction: session.direction(),
-            session,
             status_delivery: super::status::StatusDelivery::new(
                 config.status_refresh_interval,
                 Instant::now(),
+                session.is_regulated(),
             ),
+            session,
             served_blocks_inflight: 0,
             served_block_requests: VecDeque::new(),
         }
