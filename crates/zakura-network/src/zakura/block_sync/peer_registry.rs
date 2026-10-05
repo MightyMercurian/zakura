@@ -134,8 +134,21 @@ enum BodyRetryReason {
     Incompatible,
 }
 
-type SupplierRetries =
-    HashMap<(zakura_header_chain::SourceId, BodyRetryKey, BodyRetryReason), Instant>;
+type SupplierRetryKey = (zakura_header_chain::SourceId, BodyRetryKey, BodyRetryReason);
+type SupplierRetries = HashMap<SupplierRetryKey, Instant>;
+
+/// Rekeying can merge snapshots of one cooldown. Keep its latest deadline.
+fn collect_supplier_retries(
+    entries: impl Iterator<Item = (SupplierRetryKey, Instant)>,
+) -> SupplierRetries {
+    entries.fold(SupplierRetries::new(), |mut merged, (key, deadline)| {
+        merged
+            .entry(key)
+            .and_modify(|until| *until = (*until).max(deadline))
+            .or_insert(deadline);
+        merged
+    })
+}
 
 /// Authority and deadlines share a lock so stale routine snapshots cannot undo a refresh.
 #[derive(Debug, Default)]
@@ -288,8 +301,9 @@ impl PeerRegistry {
         for (scope, hash) in bodies {
             let scope = match retries.current {
                 Some(current) if current.body_work_epoch == scope.body_work_epoch => current,
-                Some(_) => continue, // A destructive reset retired this work.
-                None => scope,
+                Some(current) if current.body_work_epoch > scope.body_work_epoch => continue,
+                // Fresh work can reach a routine before the sequencer handles its reset.
+                _ => scope,
             };
             let key = (
                 source,
@@ -334,13 +348,24 @@ impl PeerRegistry {
         let mut all_retries = self.body_retry_all_lock();
         let mut retries = self.body_retry_lock();
         retries.current = current;
-        retries.entries.retain(|(_, key, _), _| {
-            current.is_some_and(|scope| {
-                key.header_generation == scope.header_generation
-                    && key.branch == scope.branch
-                    && key.body_work_epoch == scope.body_work_epoch
-            })
-        });
+        retries.entries =
+            collect_supplier_retries(std::mem::take(&mut retries.entries).into_iter().filter_map(
+                |((source, mut key, reason), deadline)| {
+                    let scope = current?;
+                    if reason == BodyRetryReason::Incompatible {
+                        if key.body_work_epoch < scope.body_work_epoch {
+                            return None;
+                        }
+                        if key.body_work_epoch == scope.body_work_epoch {
+                            key = BodyRetryKey::new(scope, key.hash);
+                        }
+                        // A newer epoch may already have reported an incompatibility.
+                    } else if key != BodyRetryKey::new(scope, key.hash) {
+                        return None;
+                    }
+                    Some(((source, key, reason), deadline))
+                },
+            ));
         all_retries.retain(|key, _| {
             current.is_some_and(|scope| {
                 key.header_generation == scope.header_generation
@@ -370,15 +395,18 @@ impl PeerRegistry {
                 (key, deadline)
             })
             .collect();
-        retries.entries = std::mem::take(&mut retries.entries)
-            .into_iter()
-            .map(|((source, mut key, reason), deadline)| {
-                key.header_generation = current.header_generation;
-                key.branch = current.branch;
-                key.body_work_epoch = current.body_work_epoch;
-                ((source, key, reason), deadline)
-            })
-            .collect();
+        retries.entries =
+            collect_supplier_retries(std::mem::take(&mut retries.entries).into_iter().map(
+                |((source, mut key, reason), deadline)| {
+                    // Compatible refreshes cannot adopt a cooldown from a future epoch.
+                    if reason != BodyRetryReason::Incompatible
+                        || key.body_work_epoch == current.body_work_epoch
+                    {
+                        key = BodyRetryKey::new(current, key.hash);
+                    }
+                    ((source, key, reason), deadline)
+                },
+            ));
     }
 
     /// Match supplier cooldowns using the registry's authority while work snapshots refresh.
@@ -1238,6 +1266,49 @@ mod floor_bias_tests {
             assert!(!registry.is_body_retry_avoided(&peer, reset, hash, now));
             assert!(!registry.is_body_retry_avoided(&peer, old, hash, now));
         }
+    }
+
+    /// A cooldown reported before its reset notification survives without blocking old work.
+    #[test]
+    fn incompatible_cooldown_from_new_work_survives_a_pending_epoch_reset() {
+        let registry = PeerRegistry::new();
+        let old = super::super::test_work_scope();
+        let fresh = zakura_header_chain::BodyWorkAuthority {
+            body_work_epoch: old.body_work_epoch.checked_next().unwrap(),
+            ..old
+        };
+        let peer = peer(1);
+        let hash = block::Hash([8; 32]);
+        let now = Instant::now();
+        registry.refresh_body_retry_scope(old);
+        registry.defer_incompatible_bodies(
+            zakura_header_chain::SourceId::from_digest(peer.digest()),
+            [(fresh, hash)],
+            now + Duration::from_secs(60),
+        );
+        let refreshed = zakura_header_chain::BodyWorkAuthority {
+            header: zakura_header_chain::HeaderWorkAuthority {
+                header_generation: fresh.header_generation.checked_next().unwrap(),
+                ..fresh.header
+            },
+            ..fresh
+        };
+        registry.defer_incompatible_bodies(
+            zakura_header_chain::SourceId::from_digest(peer.digest()),
+            [(refreshed, hash)],
+            now + Duration::from_secs(10),
+        );
+        registry.refresh_body_retry_scope(old);
+        assert!(registry.is_body_retry_avoided(&peer, fresh, hash, now));
+        assert!(!registry.is_body_retry_avoided(&peer, old, hash, now));
+        registry.retain_body_retry_scope(Some(refreshed));
+        assert!(registry.is_body_retry_avoided(&peer, fresh, hash, now + Duration::from_secs(30)));
+        assert!(!registry.is_body_retry_avoided(&peer, old, hash, now));
+        registry.retain_body_retry_scope(Some(zakura_header_chain::BodyWorkAuthority {
+            body_work_epoch: fresh.body_work_epoch.checked_next().unwrap(),
+            ..fresh
+        }));
+        assert!(!registry.is_body_retry_avoided(&peer, fresh, hash, now));
     }
 
     /// Caller iteration can inspect registry state without nesting its retry mutex.
