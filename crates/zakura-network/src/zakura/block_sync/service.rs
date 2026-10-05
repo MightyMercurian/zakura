@@ -498,6 +498,83 @@ impl BlockSyncService {
             .len()
     }
 
+    /// Recheck local policy, skipping only capacity already owned by the session.
+    fn demand_for_session(
+        &self,
+        conn_id: ZakuraConnId,
+        peer: &ZakuraPeerId,
+        negotiated: u64,
+        direction: ServicePeerDirection,
+        reserved: bool,
+    ) -> SessionDemand {
+        if let Some(deadline) = self.peer_park_deadline(peer) {
+            return SessionDemand::RetryAt(deadline);
+        }
+
+        if !reserved
+            && negotiated & ZAKURA_CAP_BLOCK_SYNC_REGULATED != 0
+            && self
+                .inner
+                .routine_wiring
+                .as_ref()
+                .is_some_and(|wiring| wiring.serving.is_some())
+        {
+            let demand = self.inner.sessions.demand(direction);
+            if !matches!(demand, SessionDemand::OpenNow) {
+                return demand;
+            }
+        }
+
+        let mut peer_snapshot = self.inner.peer_snapshot.clone();
+        peer_snapshot.borrow_and_update();
+        if !self.peer_slots_free(direction) {
+            return SessionDemand::WaitForChange(Box::pin(async move {
+                if peer_snapshot.changed().await.is_err() {
+                    std::future::pending::<()>().await;
+                }
+            }));
+        }
+
+        // A newly negotiated peer is still admitted at the tip so it can
+        // exchange status and serve the remote. This gate applies only after a
+        // local park: if another peer filled the body gap during the cooldown,
+        // keep this session absent until block sync publishes useful work again.
+        let native_applying = self
+            .service_demand
+            .as_ref()
+            .is_none_or(|demand| demand.borrow().block.is_applying());
+        if native_applying && self.session_needs_body_work(peer, conn_id) {
+            let mut candidates = self.inner.candidates.clone();
+            if candidates
+                .borrow_and_update()
+                .missing_block_bodies
+                .is_empty()
+            {
+                let mut service_demand = self.service_demand.clone();
+                return SessionDemand::WaitForChange(Box::pin(async move {
+                    if let Some(demand) = service_demand.as_mut() {
+                        tokio::select! {
+                            changed = candidates.changed() => {
+                                if changed.is_err() {
+                                    std::future::pending::<()>().await;
+                                }
+                            }
+                            changed = demand.changed() => {
+                                if changed.is_err() {
+                                    std::future::pending::<()>().await;
+                                }
+                            }
+                        }
+                    } else if candidates.changed().await.is_err() {
+                        std::future::pending::<()>().await;
+                    }
+                }));
+            }
+        }
+
+        SessionDemand::OpenNow
+    }
+
     fn peer_slots_free(&self, direction: ServicePeerDirection) -> bool {
         let peers = self
             .inner
@@ -599,71 +676,17 @@ impl Service for BlockSyncService {
         negotiated: u64,
         direction: ServicePeerDirection,
     ) -> SessionDemand {
-        if let Some(deadline) = self.peer_park_deadline(peer) {
-            return SessionDemand::RetryAt(deadline);
-        }
+        self.demand_for_session(conn_id, peer, negotiated, direction, false)
+    }
 
-        if negotiated & ZAKURA_CAP_BLOCK_SYNC_REGULATED != 0
-            && self
-                .inner
-                .routine_wiring
-                .as_ref()
-                .is_some_and(|wiring| wiring.serving.is_some())
-        {
-            let demand = self.inner.sessions.demand(direction);
-            if !matches!(demand, SessionDemand::OpenNow) {
-                return demand;
-            }
-        }
-
-        let mut peer_snapshot = self.inner.peer_snapshot.clone();
-        peer_snapshot.borrow_and_update();
-        if !self.peer_slots_free(direction) {
-            return SessionDemand::WaitForChange(Box::pin(async move {
-                if peer_snapshot.changed().await.is_err() {
-                    std::future::pending::<()>().await;
-                }
-            }));
-        }
-
-        // A newly negotiated peer is still admitted at the tip so it can
-        // exchange status and serve the remote. This gate applies only after a
-        // local park: if another peer filled the body gap during the cooldown,
-        // keep this session absent until block sync publishes useful work again.
-        let native_applying = self
-            .service_demand
-            .as_ref()
-            .is_none_or(|demand| demand.borrow().block.is_applying());
-        if native_applying && self.session_needs_body_work(peer, conn_id) {
-            let mut candidates = self.inner.candidates.clone();
-            if candidates
-                .borrow_and_update()
-                .missing_block_bodies
-                .is_empty()
-            {
-                let mut service_demand = self.service_demand.clone();
-                return SessionDemand::WaitForChange(Box::pin(async move {
-                    if let Some(demand) = service_demand.as_mut() {
-                        tokio::select! {
-                            changed = candidates.changed() => {
-                                if changed.is_err() {
-                                    std::future::pending::<()>().await;
-                                }
-                            }
-                            changed = demand.changed() => {
-                                if changed.is_err() {
-                                    std::future::pending::<()>().await;
-                                }
-                            }
-                        }
-                    } else if candidates.changed().await.is_err() {
-                        std::future::pending::<()>().await;
-                    }
-                }));
-            }
-        }
-
-        SessionDemand::OpenNow
+    fn reserved_session_demand(
+        &self,
+        conn_id: ZakuraConnId,
+        peer: &ZakuraPeerId,
+        negotiated: u64,
+        direction: ServicePeerDirection,
+    ) -> SessionDemand {
+        self.demand_for_session(conn_id, peer, negotiated, direction, true)
     }
 
     fn wants_peer(
@@ -1340,6 +1363,46 @@ mod regulated_frame_tests {
                 version == 3 && depth >= 2
             );
             connection.cancel();
+        }
+    }
+
+    /// A reserved remote offer must retain policy checks without buying a second slot.
+    #[tokio::test]
+    async fn reserved_regulated_session_uses_the_last_slot_in_either_direction() {
+        let mut config = ZakuraBlockSyncConfig::default();
+        config.peer_limits.max_inbound_peers = 1;
+        config.peer_limits.max_outbound_peers = 1;
+        config.peer_limits.max_pending_escalations = 2;
+        let service = BlockSyncService::new_with_startup(
+            BlockSyncStartup::inert(config).with_range_source(Arc::new(EmptySource)),
+        );
+        let peer = ZakuraPeerId::new(vec![47; 32]).unwrap();
+        for direction in [
+            ServicePeerDirection::Inbound,
+            ServicePeerDirection::Outbound,
+        ] {
+            let reserved = service
+                .reserve_session_for_stream(BLOCK_SYNC_SERVICE_STREAMS[0], direction)
+                .unwrap()
+                .unwrap();
+            assert!(matches!(
+                service.session_demand(1, &peer, ZAKURA_CAP_BLOCK_SYNC_REGULATED, direction,),
+                SessionDemand::WaitForChange(_)
+            ));
+            assert!(matches!(
+                service.reserved_session_demand(
+                    1,
+                    &peer,
+                    ZAKURA_CAP_BLOCK_SYNC_REGULATED,
+                    direction,
+                ),
+                SessionDemand::OpenNow
+            ));
+            drop(reserved);
+            assert!(matches!(
+                service.session_demand(1, &peer, ZAKURA_CAP_BLOCK_SYNC_REGULATED, direction,),
+                SessionDemand::OpenNow
+            ));
         }
     }
 
