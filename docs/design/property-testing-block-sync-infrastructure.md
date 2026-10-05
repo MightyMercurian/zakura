@@ -145,20 +145,43 @@ with completion tracking. The complete GetBlocks range index and queue account f
 7,230,240 additional bytes. These are allocator-requested bytes. The earlier 66-byte candidate
 container excluded lifecycle handling and has been replaced by these production-path probes.
 
-A separate production-session workload queues 64,000 requests, completes and refills 512, cancels
-the session, then queues a full replacement before the old dispatch cleans up. It verifies cleanup
-returns execution capacity. On this host its test process peaked at 32,948,224 bytes RSS under
-`/usr/bin/time -l`. The two-request cancellation regression process peaked at 21,725,184 bytes.
-These whole-process peaks include the test runtime and loaded code. They are not additive per-peer
-costs or measurements of a production node. This workload uses empty storage results and an
-in-memory framed transport, so it does not establish live-storage or QUIC buffer peaks.
+The automatic `compact_session_lifecycle_peak` regression runs the production serving session
+in an isolated test process. One allocation observation follows ownership across the reader and
+encoding workers, without resetting between transitions. It queues 64,000 requests, completes
+all of them, leaves the session idle, reuses all the heights, then cancels and queues a full
+replacement before the old dispatch cleans up. An allocator test separately verifies that storage
+allocated on one thread and freed on another leaves the observation.
 
-Run `compact_session_lifecycle_peak` from the compiled test binary with `--exact --ignored
---nocapture`, `ZAKURA_CAPACITY_PROBE=1`, and an external process peak-memory sampler. Do not use
-the thread-local allocation helper across this async workload: encoding workers move ownership
-between threads, which that helper cannot account for. The ignored maximum-session probe still
-requires `ZAKURA_LARGE_LOAD_TEST=1` and a dedicated host because it retains several GB. No advertised
-capacity default changed.
+| Lifecycle checkpoint | Retained bookkeeping bytes |
+| --- | --- |
+| Fixed session setup | 10,540 |
+| 64,000 admitted requests | 7,240,780 |
+| All endings sent, no further admission | 4,625,793 |
+| Session dropped, old dispatch has not cleaned up | 2,639,617 |
+| Full replacement queued before old cleanup | 9,879,833 |
+| Both sessions and runtime dropped | 40 |
+
+The measured lifecycle peak was 9,881,145 bytes. Small runtime allocations are included here,
+so fixed setup differs slightly from the synchronous admission probe. Allocator bookkeeping,
+fragmentation and reserved virtual memory are excluded. This workload uses empty storage results
+and an in-memory framed transport. It does not establish live-storage or QUIC buffer peaks.
+
+The test asserts ceilings at each checkpoint: 16 KiB for fixed setup, 160 bytes per request for
+admission, 96 bytes per request for idle retention, and 64 bytes per request for retiring jobs.
+Execution has an additional 128 KiB worker allowance. Replacement overlap allows two fixed session
+costs, worker overhead, and 224 bytes per request (160 for the replacement plus 64 for retiring
+jobs). Final cleanup must retain at most 16 KiB. These ceilings detect regressions on the tested
+lifecycle. They do not establish how many retiring sessions can overlap across a node.
+
+Idle retention is intentional: the completion buffer and completed range index remain until the
+next admission or session teardown. Admission drains before checking overlap, so an idle session
+can reuse completed heights. This retention fits within the session's peak allowance and is not
+added to that peak a second time. A node budget must separately allow for replacement cleanup,
+requester state, storage results, transport buffering and allocator overhead.
+
+The lifecycle test runs automatically with the network unit tests. The ignored maximum-session
+probe still requires `ZAKURA_LARGE_LOAD_TEST=1` and a dedicated host because it retains several GB.
+No advertised capacity default changed.
 
 The advertisement covers requests outstanding until their endings arrive at the requester.
 The server releases a commitment when it queues the ending, while output grants remain charged
