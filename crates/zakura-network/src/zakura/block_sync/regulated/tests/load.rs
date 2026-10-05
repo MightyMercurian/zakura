@@ -211,3 +211,44 @@ fn requester_reservation_allocations() {
         }
     }
 }
+
+/// Measure candidate containers, not a replacement with validated lifecycle semantics.
+#[tokio::test]
+#[ignore = "manual allocation evidence; requires ZAKURA_CAPACITY_PROBE=1"]
+#[allow(clippy::print_stderr)]
+async fn compact_waiting_containers() {
+    if std::env::var_os("ZAKURA_CAPACITY_PROBE").is_none() {
+        return;
+    }
+    let count = 64_000_u32;
+    let limits = capacity(MAX_BS_RESPONSE_BYTES);
+    let producer = Arc::new(Server::new(store(&[], false), 1, MAX_BS_RESPONSE_BYTES).unwrap());
+    let cancel = CancellationToken::new();
+    let (send, output) = framed_channel(4);
+    let serve = limits.session(
+        producer,
+        &ZakuraPeerId::new(vec![19; 32]).unwrap(),
+        count / 2,
+        send,
+        cancel.clone(),
+        cancel.clone(),
+    );
+    // A shared range index can carry a generation rather than a watch channel
+    // and per-entry future. Production would still need atomic completion and
+    // stale-generation handling on cancellation, replacement, and out-of-order jobs.
+    let (ranges, measured) = zakura_test::allocations::measure(|| {
+        let mut ranges = std::collections::BTreeMap::new();
+        for height in 1..=count {
+            let range = Range::new(block::Height(height), 1).unwrap();
+            serve.admit(range).unwrap();
+            ranges.insert(range.start, (range.start, u64::from(height)));
+        }
+        ranges
+    });
+    assert_eq!(serve.open(), count);
+    assert_eq!(ranges.len(), usize::try_from(count).unwrap());
+    eprintln!("compact_candidate count={count} {measured:?}");
+    cancel.cancel();
+    drop((ranges, serve, output));
+    tokio::task::yield_now().await;
+}
