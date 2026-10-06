@@ -181,6 +181,24 @@ fn classify_find_response<E>(result: &Result<Response, E>) -> Option<StallOutcom
     }
 }
 
+/// Returns true if `req` asks for data that a zcashd-compat sidecar peer never has.
+///
+/// The sidecar follows only this node, so it has no blocks, headers or peer addresses this node
+/// lacks, and it relays its own wallet transactions to this node. zcashd also leaves some of these
+/// requests unanswered (an empty `mempool`, a `getblocks` with nothing newer, a repeated
+/// `getaddr`, and any `getheaders` during its initial block download). Each unanswered request
+/// holds the sidecar's only connection until it times out, and the block `inv`s the sidecar
+/// follows queue behind it, then arrive late, together, and possibly out of order.
+fn sidecar_cannot_serve(req: &Request) -> bool {
+    matches!(
+        req,
+        Request::FindBlocks { .. }
+            | Request::FindHeaders { .. }
+            | Request::MempoolTransactionIds
+            | Request::Peers
+    )
+}
+
 /// A [`tower::Service`] that abstractly represents "the rest of the network".
 ///
 /// # Security
@@ -909,8 +927,20 @@ where
     }
 
     /// Performs P2C on `self.ready_services` to randomly select a less-loaded ready service.
-    fn select_ready_p2c_peer(&self) -> Option<D::Key> {
-        self.select_p2c_peer_from_list(&self.ready_services.keys().copied().collect())
+    ///
+    /// Skips zcashd-compat sidecar peers when `req` is a request they cannot serve, see
+    /// [`sidecar_cannot_serve`].
+    fn select_ready_p2c_peer(&self, req: &Request) -> Option<D::Key> {
+        let skip_sidecars = sidecar_cannot_serve(req);
+
+        self.select_p2c_peer_from_list(
+            &self
+                .ready_services
+                .iter()
+                .filter(|(_, service)| !(skip_sidecars && self.is_zcashd_compat_peer(service)))
+                .map(|(key, _)| *key)
+                .collect(),
+        )
     }
 
     /// Performs P2C on `ready_service_list` to randomly select a less-loaded ready service.
@@ -1029,7 +1059,7 @@ where
 
     /// Routes a request using P2C load-balancing.
     fn route_p2c(&mut self, req: Request) -> <Self as tower::Service<Request>>::Future {
-        if let Some(p2c_key) = self.select_ready_p2c_peer() {
+        if let Some(p2c_key) = self.select_ready_p2c_peer(&req) {
             tracing::trace!(
                 peer = %p2c_key.addr_label(self.expose_peer_addresses),
                 "routing based on p2c"
@@ -1054,8 +1084,9 @@ where
                 &req,
                 Request::FindBlocks { .. } | Request::FindHeaders { .. }
             );
+            // Find requests never select a sidecar (see `sidecar_cannot_serve`), so stall
+            // tracking cannot evict a lagging sidecar.
             let track_stalls = is_find_request
-                && !self.is_zcashd_compat_peer(&svc)
                 && !self
                     .minimum_peer_version
                     .chain_tip()
