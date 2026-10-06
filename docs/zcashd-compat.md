@@ -200,13 +200,15 @@ different address (for example across containers).
 
 When `zcashd_compat.enabled = true`, Zakura always includes inbound sidecar
 peers in block inventory gossip, so zcashd does not depend on random peer
-sampling to learn about new blocks. Zakura only asks a sidecar peer for block
-hashes or headers if it advertised more blocks than Zakura has, and doesn't wait
-for its replies to `mempool` or `getaddr`: zcashd leaves some of those requests
-unanswered, which would hold up the block announcements the sidecar depends on.
-If `block_gossip_peer_ips` is empty, Zakura defaults it to loopback addresses.
-For an externally managed sidecar that connects from another local or private
-IP, enable zcashd-compat without supervision and configure that address
+sampling to learn about new blocks. Zakura treats every inbound legacy peer from
+`block_gossip_peer_ips` as a sidecar, so no other node should connect to Zakura
+from those addresses. Zakura only asks a sidecar peer for block hashes or
+headers if its handshake advertised more blocks than Zakura has, and doesn't
+wait for its replies to `mempool` or `getaddr`: zcashd leaves some of those
+requests unanswered, which would hold up the block announcements the sidecar
+depends on. If `block_gossip_peer_ips` is empty, Zakura defaults it to loopback
+addresses. For an externally managed sidecar that connects from another local or
+private IP, enable zcashd-compat without supervision and configure that address
 explicitly:
 
 ```toml
