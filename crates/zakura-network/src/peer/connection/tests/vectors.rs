@@ -21,7 +21,7 @@ use tracing::Span;
 
 use zakura_chain::{
     block,
-    serialization::SerializationError,
+    serialization::{DateTime32, SerializationError},
     transaction::{self, UnminedTxId},
 };
 use zakura_test::mock_service::{MockService, PanicAssertion};
@@ -33,9 +33,9 @@ use crate::{
         ClientRequest, ErrorSlot,
     },
     peer_set::ActiveConnectionCounter,
-    protocol::external::Message,
-    types::Nonce,
-    PeerError, PeerSource, Request, Response,
+    protocol::external::{types::PeerServices, Message},
+    types::{MetaAddr, Nonce},
+    PeerError, PeerSocketAddr, PeerSource, Request, Response,
 };
 
 /// Test that the connection run loop works as a future
@@ -1136,6 +1136,75 @@ async fn protected_connection_does_not_wait_for_mempool_or_getaddr_replies() {
         })
         .await
         .respond(Response::Nil);
+
+    let error = shared_error_slot.try_get_error();
+    assert!(error.is_none(), "unexpected error: {error:?}");
+
+    connection_handle.abort();
+}
+
+/// On a protected (zcashd-compat sidecar) connection, an `addr` that arrives after the no-wait
+/// `getaddr` is cached and returned by the next `Peers` request.
+#[tokio::test]
+async fn protected_connection_caches_late_addr_reply() {
+    let _init_guard = zakura_test::init();
+    let (mut peer_tx, peer_rx) = mpsc::channel(1);
+    let (
+        connection,
+        mut client_tx,
+        _inbound_service,
+        mut peer_outbound_messages,
+        shared_error_slot,
+    ) = new_protected_test_connection();
+    let connection_handle = tokio::spawn(connection.run(peer_rx));
+
+    let peers_request = |tx| ClientRequest {
+        request: Request::Peers,
+        tx,
+        inv_collector: None,
+        transient_addr: None,
+        span: Span::none(),
+    };
+
+    let (response_tx, response_rx) = oneshot::channel();
+    client_tx
+        .send(peers_request(response_tx))
+        .await
+        .expect("connection accepts client requests");
+    assert_eq!(peer_outbound_messages.next().await, Some(Message::GetAddr));
+    let response = tokio::time::timeout(Duration::from_secs(5), response_rx)
+        .await
+        .expect("the request should finish without waiting for the peer")
+        .expect("the connection sends a response")
+        .expect("the response is not an error");
+    assert_eq!(response, Response::Peers(Vec::new()));
+
+    // The peer's reply arrives later, unsolicited.
+    let addr = MetaAddr::new_gossiped_meta_addr(
+        "1.2.3.4:8233"
+            .parse::<PeerSocketAddr>()
+            .expect("test peer address is valid"),
+        PeerServices::NODE_NETWORK,
+        DateTime32::now(),
+    );
+    peer_tx
+        .send(Ok(Message::Addr(vec![addr])))
+        .await
+        .expect("test peer channel is open");
+    tokio::task::yield_now().await;
+
+    // The next `Peers` request is answered from the cache.
+    let (response_tx, response_rx) = oneshot::channel();
+    client_tx
+        .send(peers_request(response_tx))
+        .await
+        .expect("connection accepts client requests");
+    let response = tokio::time::timeout(Duration::from_secs(5), response_rx)
+        .await
+        .expect("the cached addresses answer the request")
+        .expect("the connection sends a response")
+        .expect("the response is not an error");
+    assert_eq!(response, Response::Peers(vec![addr]));
 
     let error = shared_error_slot.try_get_error();
     assert!(error.is_none(), "unexpected error: {error:?}");
