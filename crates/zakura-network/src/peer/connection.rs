@@ -975,6 +975,22 @@ where
         self.shutdown_async(error).await;
     }
 
+    /// Returns `handler` to wait for the peer's reply to a `getaddr` or `mempool`, or, for a
+    /// protected (zcashd-compat sidecar) peer, a handler that finishes at once with the empty
+    /// `response`.
+    ///
+    /// zcashd sends nothing for a repeated `getaddr` or an empty `mempool`, so waiting would hold
+    /// the sidecar's only connection until the request times out, and the block `inv`s the sidecar
+    /// follows would queue behind it. A reply still arrives later as an unsolicited `addr` or
+    /// transaction `inv`, which this connection caches or forwards as transaction gossip.
+    fn reply_handler(&self, handler: Handler, response: Response) -> Handler {
+        if self.connection_info.is_protected_peer {
+            Handler::Finished(Ok(response))
+        } else {
+            handler
+        }
+    }
+
     /// Handle an internal client request, possibly generating outgoing messages to the
     /// remote peer.
     ///
@@ -1038,11 +1054,13 @@ where
 
                 Ok(Handler::Finished(Ok(Response::Peers(response_addrs))))
             }
-            (AwaitingRequest, Peers) => self
-                .peer_tx
-                .send(Message::GetAddr)
-                .await
-                .map(|()| Handler::Peers),
+            (AwaitingRequest, Peers) => {
+                let handler = self.reply_handler(Handler::Peers, Response::Peers(Vec::new()));
+                self.peer_tx
+                    .send(Message::GetAddr)
+                    .await
+                    .map(|()| handler)
+            }
 
             (AwaitingRequest, Ping(nonce)) => {
                 let ping_sent_at = Instant::now();
@@ -1102,13 +1120,14 @@ where
             }
 
             (AwaitingRequest, MempoolTransactionIds) => {
-                self
-                    .peer_tx
+                let handler = self.reply_handler(
+                    Handler::MempoolTransactionIds,
+                    Response::TransactionIds(Vec::new()),
+                );
+                self.peer_tx
                     .send(Message::Mempool)
                     .await
-                    .map(|()|
-                         Handler::MempoolTransactionIds
-                    )
+                    .map(|()| handler)
             }
 
             (AwaitingRequest, PushTransaction(transaction, _)) => {

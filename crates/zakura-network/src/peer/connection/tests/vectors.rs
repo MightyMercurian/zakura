@@ -19,7 +19,11 @@ use indexmap::IndexSet;
 use tower::load_shed::error::Overloaded;
 use tracing::Span;
 
-use zakura_chain::{block, serialization::SerializationError};
+use zakura_chain::{
+    block,
+    serialization::SerializationError,
+    transaction::{self, UnminedTxId},
+};
 use zakura_test::mock_service::{MockService, PanicAssertion};
 
 use crate::{
@@ -1066,6 +1070,124 @@ async fn protected_connection_attributes_inbound_block_request() {
         })
         .await
         .respond_error(Overloaded::new().into());
+
+    connection_handle.abort();
+}
+
+/// A protected (zcashd-compat sidecar) connection sends `mempool` and `getaddr` without waiting
+/// for replies, and forwards a late reply to `mempool` as transaction gossip.
+#[tokio::test]
+async fn protected_connection_does_not_wait_for_mempool_or_getaddr_replies() {
+    let _init_guard = zakura_test::init();
+    let (mut peer_tx, peer_rx) = mpsc::channel(1);
+    let (
+        connection,
+        mut client_tx,
+        mut inbound_service,
+        mut peer_outbound_messages,
+        shared_error_slot,
+    ) = new_protected_test_connection();
+    let connection_handle = tokio::spawn(connection.run(peer_rx));
+
+    for (request, outbound_message, expected_response) in [
+        (
+            Request::MempoolTransactionIds,
+            Message::Mempool,
+            Response::TransactionIds(Vec::new()),
+        ),
+        (
+            Request::Peers,
+            Message::GetAddr,
+            Response::Peers(Vec::new()),
+        ),
+    ] {
+        let (response_tx, response_rx) = oneshot::channel();
+        client_tx
+            .send(ClientRequest {
+                request,
+                tx: response_tx,
+                inv_collector: None,
+                transient_addr: None,
+                span: Span::none(),
+            })
+            .await
+            .expect("connection accepts client requests");
+
+        assert_eq!(peer_outbound_messages.next().await, Some(outbound_message));
+
+        // The peer never replies, but the request still finishes.
+        let response = tokio::time::timeout(Duration::from_secs(5), response_rx)
+            .await
+            .expect("the request should finish without waiting for the peer")
+            .expect("the connection sends a response")
+            .expect("the response is not an error");
+        assert_eq!(response, expected_response);
+    }
+
+    // A late reply to `mempool` arrives as an unsolicited transaction `inv`.
+    let tx_id = UnminedTxId::Legacy(transaction::Hash([7; 32]));
+    peer_tx
+        .send(Ok(Message::Inv(vec![tx_id.into()])))
+        .await
+        .expect("test peer channel is open");
+    inbound_service
+        .expect_request_that(|request| {
+            matches!(request, Request::AdvertiseTransactionIds(ids, _) if ids.contains(&tx_id))
+        })
+        .await
+        .respond(Response::Nil);
+
+    let error = shared_error_slot.try_get_error();
+    assert!(error.is_none(), "unexpected error: {error:?}");
+
+    connection_handle.abort();
+}
+
+/// An ordinary connection still waits for the peer's reply to `mempool`.
+#[tokio::test]
+async fn connection_waits_for_mempool_reply_from_ordinary_peer() {
+    let _init_guard = zakura_test::init();
+    let (mut peer_tx, peer_rx) = mpsc::channel(1);
+    let (
+        connection,
+        mut client_tx,
+        _inbound_service,
+        mut peer_outbound_messages,
+        _shared_error_slot,
+    ) = new_test_connection();
+    let connection_handle = tokio::spawn(connection.run(peer_rx));
+
+    let (response_tx, mut response_rx) = oneshot::channel();
+    client_tx
+        .send(ClientRequest {
+            request: Request::MempoolTransactionIds,
+            tx: response_tx,
+            inv_collector: None,
+            transient_addr: None,
+            span: Span::none(),
+        })
+        .await
+        .expect("connection accepts client requests");
+
+    assert_eq!(peer_outbound_messages.next().await, Some(Message::Mempool));
+    tokio::task::yield_now().await;
+    assert!(
+        matches!(response_rx.try_recv(), Ok(None)),
+        "the request should wait for the peer's reply",
+    );
+
+    let tx_id = UnminedTxId::Legacy(transaction::Hash([7; 32]));
+    peer_tx
+        .send(Ok(Message::Inv(vec![tx_id.into()])))
+        .await
+        .expect("test peer channel is open");
+
+    let response = tokio::time::timeout(Duration::from_secs(5), response_rx)
+        .await
+        .expect("the reply should finish the request")
+        .expect("the connection sends a response")
+        .expect("the response is not an error");
+    assert_eq!(response, Response::TransactionIds(vec![tx_id]));
 
     connection_handle.abort();
 }

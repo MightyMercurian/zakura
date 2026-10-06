@@ -122,7 +122,7 @@ use tower::{
     Service,
 };
 
-use zakura_chain::{chain_tip::ChainTip, parameters::Network};
+use zakura_chain::{block, chain_tip::ChainTip, parameters::Network};
 
 use crate::{
     address_book::AddressMetrics,
@@ -179,24 +179,6 @@ fn classify_find_response<E>(result: &Result<Response, E>) -> Option<StallOutcom
         Ok(_) => None,
         Err(_) => Some(StallOutcome::Stall),
     }
-}
-
-/// Returns true if `req` asks for data that a zcashd-compat sidecar peer never has.
-///
-/// The sidecar follows only this node, so it has no blocks, headers or peer addresses this node
-/// lacks, and it relays its own wallet transactions to this node. zcashd also leaves some of these
-/// requests unanswered (an empty `mempool`, a `getblocks` with nothing newer, a repeated
-/// `getaddr`, and any `getheaders` during its initial block download). Each unanswered request
-/// holds the sidecar's only connection until it times out, and the block `inv`s the sidecar
-/// follows queue behind it, then arrive late, together, and possibly out of order.
-fn sidecar_cannot_serve(req: &Request) -> bool {
-    matches!(
-        req,
-        Request::FindBlocks { .. }
-            | Request::FindHeaders { .. }
-            | Request::MempoolTransactionIds
-            | Request::Peers
-    )
 }
 
 /// A [`tower::Service`] that abstractly represents "the rest of the network".
@@ -928,16 +910,29 @@ where
 
     /// Performs P2C on `self.ready_services` to randomly select a less-loaded ready service.
     ///
-    /// Skips zcashd-compat sidecar peers when `req` is a request they cannot serve, see
-    /// [`sidecar_cannot_serve`].
-    fn select_ready_p2c_peer(&self, req: &Request) -> Option<D::Key> {
-        let skip_sidecars = sidecar_cannot_serve(req);
+    /// For a `FindBlocks` or `FindHeaders` request (`is_find_request`), skips zcashd-compat
+    /// sidecar peers whose handshake advertised no more blocks than this node has. A sidecar
+    /// follows only this node, so it can only extend this node's chain if it started ahead, for
+    /// example from restored chain state. Otherwise zcashd leaves a `getblocks` with nothing newer
+    /// unanswered (and any `getheaders` during its initial block download), so the request would
+    /// hold the sidecar's only connection until it times out, and the block `inv`s the sidecar
+    /// follows would queue behind it.
+    fn select_ready_p2c_peer(&self, is_find_request: bool) -> Option<D::Key> {
+        let tip_height = self
+            .minimum_peer_version
+            .chain_tip()
+            .best_tip_height()
+            .unwrap_or(block::Height(0));
 
         self.select_p2c_peer_from_list(
             &self
                 .ready_services
                 .iter()
-                .filter(|(_, service)| !(skip_sidecars && self.is_zcashd_compat_peer(service)))
+                .filter(|(_, service)| {
+                    !(is_find_request
+                        && self.is_zcashd_compat_peer(service)
+                        && service.remote_start_height() <= tip_height)
+                })
                 .map(|(key, _)| *key)
                 .collect(),
         )
@@ -1059,7 +1054,12 @@ where
 
     /// Routes a request using P2C load-balancing.
     fn route_p2c(&mut self, req: Request) -> <Self as tower::Service<Request>>::Future {
-        if let Some(p2c_key) = self.select_ready_p2c_peer(&req) {
+        let is_find_request = matches!(
+            &req,
+            Request::FindBlocks { .. } | Request::FindHeaders { .. }
+        );
+
+        if let Some(p2c_key) = self.select_ready_p2c_peer(is_find_request) {
             tracing::trace!(
                 peer = %p2c_key.addr_label(self.expose_peer_addresses),
                 "routing based on p2c"
@@ -1080,13 +1080,8 @@ where
                 _ => None,
             };
 
-            let is_find_request = matches!(
-                &req,
-                Request::FindBlocks { .. } | Request::FindHeaders { .. }
-            );
-            // Find requests never select a sidecar (see `sidecar_cannot_serve`), so stall
-            // tracking cannot evict a lagging sidecar.
             let track_stalls = is_find_request
+                && !self.is_zcashd_compat_peer(&svc)
                 && !self
                     .minimum_peer_version
                     .chain_tip()
